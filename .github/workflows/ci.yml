@@ -1,0 +1,91 @@
+# Validate this tool with offline tests; never run a live migration in CI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality (${{ matrix.os }}, Python 3.12)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: "0.13.4"
+          enable-cache: false
+
+      - name: Install and verify Git LFS
+        shell: bash
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends git-lfs
+            else
+              brew install git-lfs
+            fi
+          fi
+          git lfs version
+          git lfs install --skip-repo
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check types
+        run: uv run --locked mypy src/git_migration
+
+      - name: Run offline tests
+        run: uv run --locked pytest
+
+      - name: Build distributions
+        run: uv build
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Scan full history for secrets
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts=--all --redact=100

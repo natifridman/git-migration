@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+test-results.xml
+dist/
+
+# Local migration configuration (sanitized templates stay in examples/).
+/migration*.yaml
+/migration*.yml
+/repositories*.csv
+
+# Credentials, migration state, and generated artifacts.
+.migration/
+.uv-cache/
+.env
+.env.*
+!.env.example
+/plan.json
+/report.json
+*.sqlite3
+*.sqlite3-*
+*.tar.gz

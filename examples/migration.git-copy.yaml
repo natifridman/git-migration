@@ -1,0 +1,39 @@
+# Git history, variables, and runner configuration; no issues or merge requests.
+schema_version: 1
+source:
+  url: https://source.example
+  token_env: GITLAB_SOURCE_TOKEN
+destination:
+  url: https://destination.example
+  token_env: GITLAB_DESTINATION_TOKEN
+compatibility:
+  mode: strict
+variables:
+  mode: project_explicit
+  # Review destination_variable_inventory before accepting inherited inputs.
+  accept_destination_inheritance: false
+group_mapping:
+  source/team: destination/team
+repositories:
+  - source_path: source/team/repo
+    destination_path: destination/team/repo
+    strategy: git_copy
+    ci_branches: [main]
+    ci_variables: []
+    # - key: API_TOKEN
+    #   value_env: MIGRATION_API_TOKEN
+    #   masked: true
+    #   hidden: true
+runners:
+  tags: [it-approved-linux]
+  # Replace the actual source tag if the repository has CI jobs.
+  tag_map: {}
+  shared_enabled: true
+  group_enabled: true
+  enforcement: job_eligibility
+features:
+  schedules: false
+  environments: false
+  pages: false
+create_missing_groups: false
+concurrency: 1

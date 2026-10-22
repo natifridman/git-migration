@@ -1,0 +1,46 @@
+[project]
+name = "git-migration"
+version = "0.1.0"
+description = "Resumable, manifest-driven GitLab project migrations"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+  "python-gitlab>=6,<9",
+  "typer>=0.16,<1",
+  "pydantic>=2.11,<3",
+  "ruamel-yaml>=0.18,<0.19",
+]
+
+[project.urls]
+Source = "https://github.com/natifridman/git-migration"
+Issues = "https://github.com/natifridman/git-migration/issues"
+
+[project.scripts]
+git-migrate = "git_migration.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-cov>=6,<8", "ruff>=0.12,<1", "mypy>=1.16,<2"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

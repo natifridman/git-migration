@@ -1,0 +1,56 @@
+# Sanitized example only. Replace hosts, paths, IDs, and tags with IT-approved values.
+schema_version: 1
+source:
+  url: https://gitlab-source.example.com
+  token_env: GITLAB_SOURCE_TOKEN
+  # ca_bundle: /etc/ssl/certs/source-gitlab-ca.pem
+destination:
+  url: https://gitlab-destination.example.com
+  token_env: GITLAB_DESTINATION_TOKEN
+  # ca_bundle: /etc/ssl/certs/destination-gitlab-ca.pem
+
+# Preserve every ancestor that supplies inherited variables. A child project must
+# retain the same relative subgroup hierarchy under its explicitly mapped root.
+group_mapping:
+  engineering: migrated-engineering
+  engineering/platform: migrated-engineering/platform
+
+repositories:
+  - source_path: engineering/platform/sample-service
+    destination_path: migrated-engineering/platform/sample-service
+    strategy: direct_transfer
+    # Empty means the default branch; enumerate additional CI branches explicitly.
+    ci_branches: [main]
+    # Source schedule IDs recorded before source schedules are disabled for freeze.
+    # Only these IDs may be activated, and only with --enable-schedules.
+    schedule_activation_ids: []
+    variable_overrides:
+      # Environment variable names only, never replacement secret values.
+      DEPLOY_TOKEN: env:MIGRATION_DESTINATION_DEPLOY_TOKEN
+      API_ENDPOINT@staging: env:MIGRATION_STAGING_API_ENDPOINT
+
+# Explicit source-user-ID to destination-user-ID mapping for environment protections.
+# This does not reassign native contribution placeholders or migrate permissions.
+user_mapping: {}
+
+runners:
+  # Discover destination group/instance runners matching every tag in enabled scopes.
+  tags: [it-approved-linux]
+  # Alternatively, omit tags and supply explicit destination runner IDs.
+  # allowed_runner_ids: [12345]
+  tag_map:
+    legacy-linux: [it-approved-linux]
+  shared_enabled: false
+  group_enabled: true
+
+features:
+  schedules: false
+  environments: false
+  pages: false
+
+create_missing_groups: false
+accept_file_import_memberships: false
+concurrency: 2
+request_timeout: 30
+import_timeout: 3600
+poll_interval: 5

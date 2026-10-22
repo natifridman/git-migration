@@ -1,0 +1,84 @@
+# Disposable two-project pilot based on examples/migration.yaml.
+# Replace hosts, paths, tags, and user mappings with IT-approved values.
+# Plan with --pilot; this designation prohibits activation of the resulting run.
+schema_version: 1
+source:
+  url: https://gitlab-source.example.com
+  token_env: GITLAB_SOURCE_TOKEN
+  # ca_bundle: /etc/ssl/certs/source-gitlab-ca.pem
+destination:
+  url: https://gitlab-destination.example.com
+  token_env: GITLAB_DESTINATION_TOKEN
+  # ca_bundle: /etc/ssl/certs/destination-gitlab-ca.pem
+
+compatibility:
+  mode: experimental_direct_transfer
+variables:
+  mode: project_explicit
+  # Set true only after reviewing destination_variable_inventory in the saved plan.
+  accept_destination_inheritance: false
+
+# Preserve namespace mapping; project_explicit does not copy source group variables.
+group_mapping:
+  engineering: migrated-engineering
+  engineering/platform: migrated-engineering/platform
+
+repositories:
+  # Use a project without CI here to cover the no_ci acceptance requirement.
+  - source_path: engineering/platform/sample-service
+    destination_path: migrated-engineering/platform/sample-service-migration-pilot
+    strategy: direct_transfer
+    ci_branches: [main]
+    schedule_activation_ids: []
+    # Reviewed, complete project-variable definitions. Values stay in the environment.
+    ci_variables:
+      - key: DEPLOY_TOKEN
+        value_env: MIGRATION_DESTINATION_DEPLOY_TOKEN
+      - key: API_ENDPOINT
+        value_env: MIGRATION_STAGING_API_ENDPOINT
+        environment_scope: staging
+  - source_path: engineering/platform/git-migration-fixture
+    destination_path: migrated-engineering/platform/git-migration-fixture-pilot
+    strategy: direct_transfer
+    ci_branches: [main]
+    schedule_activation_ids: []
+    ci_variables:
+      - key: PILOT_INPUT
+        value_env: MIGRATION_PILOT_DEFAULT
+      - key: PILOT_INPUT
+        value_env: MIGRATION_PILOT_INPUT
+        environment_scope: migration-pilot
+      - key: PILOT_FILE
+        value_env: MIGRATION_PILOT_FILE
+        variable_type: file
+        environment_scope: migration-pilot
+
+# Fill with both fixture contributors' actual source and destination user IDs.
+# This verifies attribution; native placeholder reassignment is a separate action.
+user_mapping: {}
+
+runners:
+  # Keep the base example's approved destination runner tag and enabled scopes.
+  tags: [it-approved-linux]
+  # Alternatively, omit tags and supply explicit destination runner IDs.
+  # allowed_runner_ids: [12345]
+  tag_map:
+    legacy-linux: [it-approved-linux]
+    # The synthetic fixture helper uses this source tag; migrate it through a CI MR.
+    migration-fixture: [it-approved-linux]
+  shared_enabled: false
+  group_enabled: true
+  enforcement: job_eligibility
+
+features:
+  schedules: false
+  environments: false
+  pages: false
+
+create_missing_groups: false
+accept_file_import_memberships: false
+# Prepare this disposable batch one project at a time.
+concurrency: 1
+request_timeout: 30
+import_timeout: 3600
+poll_interval: 5
