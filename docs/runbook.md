@@ -33,6 +33,30 @@ Match the complete job tag set and protected-ref requirements. Tag discovery sel
 
 Run `plan MANIFEST --output plan.json` against the actual source and destination. Check every finding, version/capability result, group mapping, selected strategy, source identity, and target path. There is no silent fallback from direct transfer to file import. Review the file-import membership acceptance gate and identity limits before enabling that strategy. Keep destination groups precreated unless explicit creation under the mapped hierarchy is intended.
 
+A blocked plan is still saved for inspection and the command exits with status 2.
+`0 repositories` means no repository completed project inventory; it does not
+necessarily mean the manifest selected none. An `inventory_failed` finding names
+the failed source/destination operation and includes the provider's sanitized HTTP
+status or connection diagnosis. Check the selected token's access to that operation
+and the project's feature settings. Planning attempts source project-variable
+inventory in both variable modes. Only `project_explicit` treats HTTP 403 from
+that read as a `source_project_variables_unknown` warning: the source count is
+unknown and omitted from `counts`, and `repositories[].ci_variables` remains the
+complete desired destination list. Review every required CI input; unavailable
+does not mean empty. `preserve_scopes` still blocks, as do other project-variable
+errors and other required inventories, including pipeline schedules even when
+restoration is disabled. Fix any remaining blockers and generate a fresh plan.
+Arbitrary server response bodies and variable values are excluded from diagnostics.
+
+`source_transfer_access` reports a failed read of the source project's
+`export_relations/status` endpoint, including the sanitized HTTP status or
+connection diagnosis. Review that reason with the source project/group owner and
+confirm export permissions, token scope, and direct-transfer availability. This
+check remains blocking in experimental and pilot modes; version-gap validation
+does not replace source export authorization. An `import_admin_check` warning
+means destination settings could not be inspected, not that imports are enabled
+or disabled; IT must confirm the settings and destination-to-source connectivity.
+
 Begin with a disposable project representative of your data: merged/open/closed MRs with threads and resolutions, protected branches/tags, LFS, inherited/environment-scoped/file variables, includes, runner restrictions, and selected optional features. Provision dedicated isolated test groups and runners. Do not use a populated destination project as a test target.
 
 Run `apply PLAN --source-frozen --destination-isolated`, retain its run ID, and inspect `report RUN`. A timeout or partial failure does not imply that the remote operation stopped. Use `resume RUN` with the same state directory after rechecking freeze and isolation. Do not rerun `apply` to recover an uncertain import. See the ambiguity procedure below.

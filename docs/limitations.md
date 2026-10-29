@@ -8,7 +8,12 @@ relations still block completion. File import cannot use this exception.
 
 `variables.mode: project_explicit` rebuilds a complete declared project-variable
 list using environment references and leaves group variables untouched. Source
-ancestor values may remain unknown. Accepted destination inheritance is tracked
+ancestor values may remain unknown. A source project-variable inventory returning
+HTTP 403 also produces a warning in this mode, with an unknown count omitted from
+the plan's existing `counts` mapping, never recorded as zero. This does not change
+the plan schema or configuration fingerprint. Other project-variable failures,
+default `preserve_scopes` inventory, destination validation, and native transfer
+authorization remain blocking. Accepted destination inheritance is tracked
 by metadata, not secret-value hashes, so this mode does not claim exact source
 variable equivalence. `runners.enforcement: job_eligibility` checks the reviewed
 jobs and smoke against approved runner IDs; it is not a permanent fleet isolation

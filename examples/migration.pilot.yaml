@@ -15,6 +15,7 @@ compatibility:
   mode: experimental_direct_transfer
 variables:
   mode: project_explicit
+  # Source project-variable HTTP 403 is a warning; ci_variables must be complete.
   # Set true only after reviewing destination_variable_inventory in the saved plan.
   accept_destination_inheritance: false
 

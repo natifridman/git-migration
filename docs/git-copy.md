@@ -33,6 +33,12 @@ Do not invent replacements for inaccessible parent variables. Leave them out of
 source/destination authentication tokens authorize the CLI and are not
 automatically copied into project variables.
 
+If the source project-variable API returns HTTP 403, `project_explicit` planning
+warns that the source count is unknown and continues using the declared inputs.
+The count is omitted from the plan, not recorded as zero. This applies even when
+source CI is enabled. Other project-variable errors and required inventories
+still block, and destination variables must pass normal reconciliation checks.
+
 Hidden source values must be supplied through environment references. For a
 hidden destination value that the API redacts, the run retains a private keyed
 creation receipt after a successful API write. Verification compares the supplied

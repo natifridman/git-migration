@@ -679,6 +679,14 @@ def test_explicit_mode_never_writes_group_variables_on_prepare_resume_verify_act
     plan.config_hash = plan.config.fingerprint()
     plan.groups = {"team": "new"}
     monkeypatch.setattr(target, "group", lambda _: {"id": 2}, raising=False)
+    original_list = source.list
+
+    def source_inventory(path: str, params: dict | None = None) -> list[dict]:
+        if path.endswith("/variables"):
+            pytest.fail("Explicit prepare/resume/verify/activate must not read source variables")
+        return original_list(path, params)
+
+    monkeypatch.setattr(source, "list", source_inventory)
     monkeypatch.setattr(
         orchestrator,
         "reconcile_variables",

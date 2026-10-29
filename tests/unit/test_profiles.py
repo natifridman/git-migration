@@ -13,6 +13,7 @@ from git_migration.compatibility import (
     pilot_evidence,
     verify_endpoints,
 )
+from git_migration.config import load_plan
 from git_migration.models import CIVariable, MigrationConfig
 from git_migration.providers import ProviderError
 from git_migration.state import StateStore
@@ -100,12 +101,181 @@ def test_project_explicit_uses_project_access_not_ancestor_owner(monkeypatch):
     plan = build_plan(c, source, target)
     assert not plan.blocked
     assert "source_variables_unknown" in codes(plan)
+    assert "source_project_variables_unknown" not in codes(plan)
+    assert plan.repositories[0].counts["variables"] == 0
     assert "never-in-the-plan" not in plan.model_dump_json()
     assert not target.writes
     verify_destination_inheritance(plan, target)
     target.variables[11][0]["protected"] = True
     with pytest.raises(VariableConflict, match="inventory changed"):
         verify_destination_inheritance(plan, target)
+
+
+@pytest.fixture
+def source_variables_forbidden(monkeypatch):
+    source, target = providers()
+    original_list, original_project = source.list, source.project
+
+    def inventory(path, params=None):
+        if path == "/projects/100/variables":
+            raise ProviderError(403, server="source.example", operation="API request")
+        return original_list(path, params)
+
+    monkeypatch.setattr(source, "list", inventory)
+    monkeypatch.setattr(
+        source, "project", lambda path: {**original_project(path), "builds_access_level": "enabled"}
+    )
+    return source, target
+
+
+@pytest.mark.parametrize("strategy", ["direct_transfer", "file_export", "git_copy"])
+@pytest.mark.parametrize("declared_variables", [False, True])
+def test_explicit_project_variable_denial_is_unknown_and_roundtrips(
+    source_variables_forbidden, monkeypatch, tmp_path, strategy, declared_variables
+):
+    source, target = source_variables_forbidden
+    c = config(variables={"mode": "project_explicit"}, accept_file_import_memberships=True)
+    c.repositories[0].strategy = strategy
+    if declared_variables:
+        c.repositories[0].ci_variables = [CIVariable(key="INPUT", value_env="INPUT_VALUE")]
+        monkeypatch.setenv("INPUT_VALUE", "synthetic-sensitive-marker")
+    original_hash = c.fingerprint()
+    plan = build_plan(c, source, target)
+    assert not plan.blocked
+    assert len(plan.repositories) == 1
+    assert plan.groups == {"team": "new", "team/sub": "new/sub"}
+    assert plan.repositories[0].counts == {
+        "merge_requests": 0,
+        "issues": 0,
+        "schedules": 0,
+        "environments": 0,
+    }
+    warning = next(f for f in plan.findings if f.code == "source_project_variables_unknown")
+    assert warning.severity == "warning"
+    assert warning.repository == "team/sub/repo"
+    assert "count is unknown" in warning.message
+    assert "HTTP 403" in warning.message
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert plan.config_hash == original_hash == c.fingerprint()
+    output = tmp_path / "plan.json"
+    output.write_text(plan.model_dump_json())
+    loaded = load_plan(output)
+    assert loaded == plan
+    assert "variables" not in loaded.repositories[0].counts
+    assert source.writes == target.writes == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "endpoint", "status"),
+    [
+        ("preserve_scopes", "variables", 403),
+        *[
+            ("project_explicit", "variables", status)
+            for status in (401, 404, 429, 500, None, "unexpected")
+        ],
+        *[
+            ("project_explicit", endpoint, 403)
+            for endpoint in ("merge_requests", "issues", "pipeline_schedules", "environments")
+        ],
+    ],
+)
+def test_explicit_project_variable_exception_does_not_hide_required_failures(
+    monkeypatch, mode, endpoint, status
+):
+    source, target = providers()
+    original = source.list
+
+    def denied(path, params=None):
+        if path == f"/projects/100/{endpoint}":
+            if status == "unexpected":
+                raise RuntimeError("synthetic-sensitive-marker")
+            raise ProviderError(status)
+        return original(path, params)
+
+    monkeypatch.setattr(source, "list", denied)
+    plan = build_plan(config(variables={"mode": mode}), source, target)
+    assert plan.blocked
+    assert "inventory_failed" in codes(plan)
+    assert "source_project_variables_unknown" not in codes(plan)
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert source.writes == target.writes == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("missing_value", "explicit_variables"),
+        ("unreviewed_inheritance", "destination_inheritance_review"),
+        ("inaccessible_inheritance", "destination_ancestor_inventory"),
+        ("transfer_denied", "source_transfer_access"),
+    ],
+)
+def test_unknown_source_variables_preserve_other_explicit_mode_gates(
+    source_variables_forbidden, monkeypatch, fault, expected
+):
+    source, target = source_variables_forbidden
+    c = config(variables={"mode": "project_explicit"})
+    if fault == "missing_value":
+        c.repositories[0].ci_variables = [CIVariable(key="INPUT", value_env="MISSING_VALUE")]
+        monkeypatch.delenv("MISSING_VALUE", raising=False)
+    elif fault == "unreviewed_inheritance":
+        target.variables[11] = [{"key": "GROUP_INPUT", "value": "synthetic-sensitive-marker"}]
+    elif fault == "inaccessible_inheritance":
+        target.inventory_failure = True
+    else:
+        original = source.get
+
+        def denied(path, params=None):
+            if path.endswith("/export_relations/status"):
+                raise ProviderError(403)
+            return original(path, params)
+
+        monkeypatch.setattr(source, "get", denied)
+    plan = build_plan(c, source, target)
+    assert plan.blocked
+    assert expected in codes(plan)
+    assert "source_project_variables_unknown" in codes(plan)
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert source.writes == target.writes == []
+
+
+@pytest.mark.parametrize("experimental", [False, True])
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ProviderError(401, server="source.example"), "HTTP 401"),
+        (ProviderError(403, server="source.example"), "HTTP 403"),
+        (ProviderError(404, server="source.example"), "HTTP 404"),
+        (ProviderError(server="source.example", reason="timeout"), "request timed out"),
+        (RuntimeError("synthetic-sensitive-marker"), "RuntimeError"),
+    ],
+)
+def test_source_transfer_access_keeps_safe_reason_and_blocks_even_in_pilot(
+    monkeypatch, experimental, error, expected
+):
+    source, target = providers()
+    original = source.get
+
+    def denied(path, params=None):
+        if path == "/projects/100/export_relations/status":
+            raise error
+        return original(path, params)
+
+    monkeypatch.setattr(source, "get", denied)
+    c = config(
+        variables={"mode": "project_explicit"},
+        compatibility={"mode": "experimental_direct_transfer" if experimental else "strict"},
+    )
+    plan = build_plan(c, source, target, pilot=experimental)
+    failure = next(f for f in plan.findings if f.code == "source_transfer_access")
+    assert plan.blocked
+    assert failure.severity == "blocker"
+    assert failure.repository == "team/sub/repo"
+    assert expected in failure.message
+    if isinstance(error, ProviderError):
+        assert "source.example" in failure.message
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert source.writes == target.writes == []
 
 
 def test_destination_inheritance_needs_explicit_acceptance():

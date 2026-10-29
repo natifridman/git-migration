@@ -68,6 +68,13 @@ plan/run pending fresh review. Value changes are not detectable from this
 metadata inventory; this mode claims destination CI configuration, not complete
 source-variable equivalence.
 
+In this mode, HTTP 403 while listing source project variables is also a warning
+(`source_project_variables_unknown`). Their count remains unknown and is omitted
+from the saved plan; it is not treated as zero. Supply the complete desired
+project inputs in `ci_variables`. Other project-variable errors, native import
+authorization, destination inheritance review, and destination variable conflict
+checks still block progress. This exception does not require disabling source CI.
+
 ## 3. Create the disposable source fixture
 
 This is a separate, mutating operation. Use the existing source subgroup Owner
