@@ -17,7 +17,12 @@ from git_migration.orchestrator import Migrator
 from git_migration.providers import clients_for
 from git_migration.reporting import show_report
 from git_migration.secrets import safe_error
-from git_migration.state import StateStore, atomic_json
+from git_migration.state import (
+    RunnerTagRevisionBlocked,
+    StateStore,
+    atomic_json,
+    validate_runner_tag_changes,
+)
 from git_migration.steps.preflight import build_plan
 
 app = typer.Typer(
@@ -120,6 +125,10 @@ def apply_command(
     destination_isolated: Annotated[
         bool, typer.Option(help="Confirm IT prevented jobs from executing during initial import")
     ] = False,
+    ci_api_isolated: bool = typer.Option(
+        False,
+        help="Allow quarantined Git-copy CI API access; attest IT excluded external triggers and policy-injected jobs",
+    ),
 ) -> None:
     """Import projects and prepare configuration; leave destination CI disabled."""
     if not source_frozen or not destination_isolated:
@@ -149,7 +158,11 @@ def apply_command(
         store = store or StateStore(ctx.obj)
         run_id = store.create_run(plan)
         typer.echo(f"Created run {run_id}; use resume with this ID after interruption.")
-        _finish(Migrator(plan, store, run_id, source, destination).prepare())
+        _finish(
+            Migrator(
+                plan, store, run_id, source, destination, ci_api_isolated=ci_api_isolated
+            ).prepare()
+        )
 
     _guard(action)
 
@@ -162,6 +175,16 @@ def resume_command(
     destination_isolated: bool = typer.Option(
         False, help="Confirm destination job isolation is still in effect"
     ),
+    ci_api_isolated: bool = typer.Option(
+        False,
+        help="Allow quarantined Git-copy CI API access; attest IT excluded external triggers and policy-injected jobs",
+    ),
+    runner_tag_map: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Correct saved Git-copy job tags before any CI MR: OLD=NEW[,NEW]; repeat as needed"
+        ),
+    ] = None,
 ) -> None:
     """Resume preparation using existing import identifiers and checkpoints."""
     if not source_frozen or not destination_isolated:
@@ -169,8 +192,17 @@ def resume_command(
         raise typer.Exit(2)
 
     def action() -> None:
+        changes: dict[str, list[str]] = {}
+        for value in runner_tag_map or []:
+            old, separator, targets = value.partition("=")
+            if not separator or old in changes:
+                raise RunnerTagRevisionBlocked("Use unique --runner-tag-map OLD=NEW[,NEW] entries")
+            changes[old] = targets.split(",")
+        if changes:
+            validate_runner_tag_changes(changes)
         store = StateStore(ctx.obj)
-        _finish(Migrator(store.plan(run_id), store, run_id).prepare())
+        migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
+        _finish(migrator.prepare(changes) if changes else migrator.prepare())
 
     _guard(action)
 
@@ -181,6 +213,10 @@ def verify_command(
     run_id: str,
     run_smoke: bool = typer.Option(
         False, help="Explicitly run a standalone safe job on each required runner tag set"
+    ),
+    ci_api_isolated: bool = typer.Option(
+        False,
+        help="Allow quarantined Git-copy CI API access; attest IT excluded external triggers and policy-injected jobs",
     ),
     smoke_isolated: bool = typer.Option(
         False,
@@ -216,7 +252,7 @@ def verify_command(
                     "Use unique --pilot-workload SOURCE_PATH=POSITIVE_PIPELINE_ID entries"
                 )
             workloads[path] = int(identifier)
-        migrator = Migrator(store.plan(run_id), store, run_id)
+        migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
         _finish(migrator.verify(run_smoke, workloads) if workloads else migrator.verify(run_smoke))
 
     _guard(action)
@@ -232,6 +268,10 @@ def activate_command(
     enable_schedules: bool = typer.Option(
         False, help="Enable only explicit schedule_activation_ids from the manifest"
     ),
+    ci_api_isolated: bool = typer.Option(
+        False,
+        help="Allow quarantined Git-copy CI API access before activation; attest IT excluded external triggers and policy-injected jobs",
+    ),
 ) -> None:
     """Reverify and enable destination CI; source projects remain untouched."""
     if not source_frozen:
@@ -240,7 +280,11 @@ def activate_command(
 
     def action() -> None:
         store = StateStore(ctx.obj)
-        _finish(Migrator(store.plan(run_id), store, run_id).activate(enable_schedules))
+        _finish(
+            Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated).activate(
+                enable_schedules
+            )
+        )
 
     _guard(action)
 

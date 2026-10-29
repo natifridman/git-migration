@@ -1,4 +1,4 @@
-# Git history, variables, and runner configuration; no issues or merge requests.
+# Git history, variables, and runner configuration; issues remain a blocker.
 schema_version: 1
 source:
   url: https://source.example
@@ -19,6 +19,8 @@ repositories:
   - source_path: source/team/repo
     destination_path: destination/team/repo
     strategy: git_copy
+    # Opt in only to omit all MR history, discussions, approvals and MR-only refs.
+    # skip_merge_request_history: true
     ci_branches: [main]
     ci_variables: []
     # - key: API_TOKEN

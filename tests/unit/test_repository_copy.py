@@ -28,6 +28,7 @@ class API:
         self.created = not target
         self.writes = []
         self.metadata = []
+        self.merge_requests = []
         self.uncertain = False
 
     def group(self, path):
@@ -45,6 +46,8 @@ class API:
         }
 
     def list(self, path, params=None):
+        if path.endswith("/merge_requests"):
+            return self.merge_requests
         return self.metadata
 
     def post(self, path, data):
@@ -131,7 +134,9 @@ def test_copy_without_tags_or_with_an_empty_repository(copy, empty):
         git("update-ref", "-d", "refs/heads/development", cwd=source.repository)
     handle = strategy.start("team/repo", "new/repo")
     assert strategy.poll(handle).status == "finished"
-    assert GitTransport().refs(str(source.repository)) == GitTransport().refs(str(target.repository))
+    assert GitTransport().refs(str(source.repository)) == GitTransport().refs(
+        str(target.repository)
+    )
 
 
 def test_uncertain_create_is_not_adopted_or_replayed(copy):
@@ -164,6 +169,98 @@ def test_changed_source_and_new_metadata_block_copy(copy):
     with pytest.raises(GitCopyBlocked, match="issues or merge requests"):
         strategy.poll(handle)
     assert not GitTransport().refs(str(target.repository))["refs"]
+
+
+def test_mr_history_requires_opt_in_and_copy_resumes_with_omission(copy):
+    strategy, source, target = copy
+    source.merge_requests = [{"iid": 1, "state": "merged"}]
+    with pytest.raises(GitCopyBlocked, match="issues or merge requests"):
+        strategy.start("team/repo", "new/repo")
+    assert not target.writes and not strategy.journal.exists()
+    git("update-ref", "refs/merge-requests/1/head", "HEAD", cwd=source.repository)
+    opted = GitCopyStrategy(source, target, strategy.work_dir, skip_merge_request_history=True)
+    handle = opted.start("team/repo", "new/repo")
+    assert handle["skip_merge_request_history"] is True
+    resumed = GitCopyStrategy(source, target, strategy.work_dir, skip_merge_request_history=True)
+    recovered = resumed.recover("team/repo", "new/repo", "unused")
+    assert resumed.poll(recovered).status == "finished"
+    assert GitTransport().refs(str(source.repository)) == GitTransport().refs(
+        str(target.repository)
+    )
+    assert "refs/merge-requests/" not in git("show-ref", cwd=target.repository)
+    assert len([p for p, _ in target.writes if p == "/projects"]) == 1
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_history_policy_cannot_change_on_resume(copy, skip):
+    strategy, source, target = copy
+    original = GitCopyStrategy(source, target, strategy.work_dir, skip_merge_request_history=skip)
+    handle = original.start("team/repo", "new/repo")
+    changed = GitCopyStrategy(
+        source, target, strategy.work_dir, skip_merge_request_history=not skip
+    )
+    with pytest.raises(GitCopyBlocked, match="history policy changed"):
+        changed.recover("team/repo", "new/repo", "unused")
+    with pytest.raises(GitCopyBlocked, match="history policy changed"):
+        changed.poll(handle)
+    assert len(target.writes) == 1
+    assert not GitTransport().refs(str(target.repository))["refs"]
+
+
+def test_skip_mrs_still_blocks_issues_before_creation_and_on_resume(copy):
+    strategy, source, target = copy
+    opted = GitCopyStrategy(source, target, strategy.work_dir, skip_merge_request_history=True)
+    source.metadata = [{"iid": 1}]
+    with pytest.raises(GitCopyBlocked, match="Source has issues"):
+        opted.start("team/repo", "new/repo")
+    assert not target.writes
+    source.metadata = []
+    handle = opted.start("team/repo", "new/repo")
+    source.metadata = [{"iid": 1}]
+    with pytest.raises(GitCopyBlocked, match="Source has issues"):
+        opted.poll(handle)
+    assert not GitTransport().refs(str(target.repository))["refs"]
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_plan_requires_explicit_mr_omission_and_still_blocks_issues(skip):
+    source, target = FakeProvider(), FakeProvider(target=True)
+    source.current_version, target.current_version = "19.6.0-pre", "19.4.3-ee"
+    c = config()
+    c.repositories[0].strategy = "git_copy"
+    c.repositories[0].skip_merge_request_history = skip
+    listing = source.list
+    source.list = lambda path, params=None: (
+        [{"iid": 1, "state": "closed"}]
+        if path.endswith("/merge_requests")
+        else listing(path, params)
+    )
+    plan = build_plan(c, source, target)
+    assert plan.blocked is not skip
+    assert ("git_copy_merge_requests_omitted" in codes(plan)) is skip
+    assert plan.repositories[0].counts["merge_requests"] == 1
+    source.list = lambda path, params=None: (
+        [{"iid": 2}] if path.endswith("/issues") else listing(path, params)
+    )
+    assert "git_copy_metadata" in codes(build_plan(c, source, target))
+    assert not target.writes
+
+
+def test_skip_mrs_does_not_hide_failed_inventory():
+    source, target = FakeProvider(), FakeProvider(target=True)
+    c = config()
+    c.repositories[0].strategy = "git_copy"
+    c.repositories[0].skip_merge_request_history = True
+    listing = source.list
+
+    def unreadable(path, params=None):
+        if path.endswith("/merge_requests"):
+            raise ProviderError(403)
+        return listing(path, params)
+
+    source.list = unreadable
+    assert "inventory_failed" in codes(build_plan(c, source, target))
+    assert not target.writes
 
 
 def test_git_copy_plans_across_version_gap_without_native_checks_or_pilot():

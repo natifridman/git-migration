@@ -54,6 +54,8 @@ def verify_merge_requests(
     target_project: dict[str, Any],
     ignored_mr_iids: set[int] | None = None,
     user_mapping: dict[int, int] | None = None,
+    *,
+    skip_merge_request_history: bool = False,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     warnings: list[str] = []
@@ -77,6 +79,21 @@ def verify_merge_requests(
         return _result(["Merge requests could not be read from both providers"], [], **evidence)
     target_mrs = [mr for mr in target_mrs if mr.get("iid") not in (ignored_mr_iids or set())]
     evidence.update(source_count=len(source_mrs), target_count=len(target_mrs))
+    if skip_merge_request_history:
+        if target_mrs:
+            blockers.append("Target contains unexpected merge requests after Git copy")
+        result = _result(
+            blockers,
+            [
+                f"History for {len(source_mrs)} source merge requests was intentionally omitted; "
+                "discussions, approvals and MR metadata were not copied"
+            ],
+            **evidence,
+            omitted_count=len(source_mrs),
+        )
+        if not blockers:
+            result["status"] = "omitted"
+        return result
     if len(source_mrs) != len(target_mrs):
         blockers.append("Merge request counts differ")
     unused = list(target_mrs)
@@ -341,6 +358,7 @@ def verify_repository(
     ignored_mr_iids: set[int] | None = None,
     user_mapping: dict[int, int] | None = None,
     require_identity_mapping: bool = False,
+    skip_merge_request_history: bool = False,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     warnings: list[str] = []
@@ -400,7 +418,13 @@ def verify_repository(
     except Exception:
         blockers.append("Repository verification could not be completed")
     merge_requests = verify_merge_requests(
-        source, destination, source_project, target_project, ignored_mr_iids, user_mapping
+        source,
+        destination,
+        source_project,
+        target_project,
+        ignored_mr_iids,
+        user_mapping,
+        skip_merge_request_history=skip_merge_request_history,
     )
     blockers.extend(merge_requests["blockers"])
     warnings.extend(merge_requests["warnings"])

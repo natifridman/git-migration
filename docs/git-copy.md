@@ -6,11 +6,45 @@ path creates a private destination project with CI, Auto DevOps, and runner acce
 disabled, then pushes Git data without invoking a native GitLab importer. It does
 not require a compatibility pilot or a synthetic fixture for a version gap.
 
-It refuses a source with issues or merge requests. Native project metadata,
+By default it refuses a source with issues or merge requests. Native project metadata,
 memberships, settings, wiki content, and integrations are not copied by Git
 transport. Optional schedule/environment/Pages preparation remains separately
 controlled by `features`. Use a native strategy when its preservation scope is
 required.
+
+## Intentionally omit merge-request history
+
+For a Git-only move of a project that has merge requests, set the per-repository
+opt-in below in your YAML manifest, keeping its existing paths and CI settings:
+
+```yaml
+repositories:
+  - source_path: source/team/repo
+    destination_path: destination/team/repo
+    strategy: git_copy
+    skip_merge_request_history: true
+```
+
+This copies branches, tags, and their reachable commit history, including commit
+authors and dates, plus LFS. It omits all source MRs (open, closed, and merged),
+their discussions, approvals, and other MR metadata. GitLab's MR-only refs are
+not copied; commits reachable only through those refs, such as an unmerged MR
+whose source branch was deleted, are outside this copy's scope. The source
+project and its history are not modified. Retain access to the source if the
+omitted history is still needed.
+
+Issues remain a blocker; this option does not accept losing issue history.
+Required API inventories remain mandatory. The plan warns with the omitted MR
+count, and verification/reporting records `merge_requests.status: omitted` and
+`omitted_count`, without claiming that MR history or its authors were verified.
+Unexpected destination MRs still block; only this run's recorded CI preparation
+MRs are excluded from that check. Review and merge those CI MRs as usual.
+
+The option is valid only with `strategy: git_copy`; keep
+`compatibility.mode: strict`. Generate a fresh plan after opting in, then follow
+[Plan and run](#plan-and-run). Do not edit the saved JSON or change an existing
+run's policy. Existing plans and checkpoints retain the default refusal; an
+interrupted opted-in run resumes with its saved setting and journal.
 
 Start from [the example](../examples/migration.git-copy.yaml), set the real
 endpoints and paths, and use `compatibility.mode: strict`. Keep the destination
@@ -57,6 +91,48 @@ require review. A repository with no CI file, no custom CI path, and disabled Au
 DevOps needs no tag edit or smoke job; it stays without CI after activation.
 Selecting a runner tag alone does not create a pipeline or add job tags.
 
+### Correct a missing tag mapping after Git copy
+
+If verification reports that no approved runner can execute a job, check the
+reported job name, tags, and protected-ref requirement. Selecting `runners.tags`
+does not rewrite a job's existing tags. Confirm that the job is intended for the
+selected fleet before changing its tag mapping.
+
+For an existing single-repository Git-copy run whose CI preparation was entirely
+`unchanged` (no CI edits or MRs), use this explicit correction:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated \
+  --runner-tag-map old-linux=it-approved-linux
+```
+
+Add `--ci-api-isolated` if the run needs the guarded CI API access described below.
+Repeat `--runner-tag-map` for different source tags; use `OLD=NEW,NEW` for multiple
+destination tags. Only literal tags present in the saved CI job inventory can be
+corrected. The correction adds or replaces those entries in the saved run's
+`runners.tag_map`, retains all other policies and approved runner IDs, and records
+the old/new maps and configuration fingerprints with the superseded checkpoints
+in `runner_tag_revision_*`. The original plan JSON and manifest are not edited.
+Update the manifest separately for future plans.
+
+This requires completed snapshot/import/baseline checks and completed unchanged
+runner preparation, with no smoke or activation attempt. Native strategies,
+pilots, multi-repository runs, incomplete preparation, and existing or uncertain
+CI edits/MRs are refused. An identical repeated correction is a no-op on saved
+configuration and resumes its original preparation; it does not discard recovery
+evidence. Keep the same run ID and private state directory.
+
+Resume prepares a draft MR editing existing CI configuration on an owned migration
+branch. Review the diff, mark the MR ready, and merge it while CI stays quarantined.
+Then run `verify RUN_ID --run-smoke --smoke-isolated` (plus `--ci-api-isolated` when
+needed). Only after verification succeeds, use `activate RUN_ID --source-frozen`
+with any required CI API attestation. Do not restart `apply`, hand-edit SQLite,
+or enable CI to work around the blocker. Other runner eligibility restrictions
+and smoke checks still apply after the tag correction.
+
+### CI inventories with CI disabled
+
 GitLab can return HTTP 403 for pipeline schedules while project CI is disabled.
 Preparation confirms that CI remains disabled and can continue with the schedule
 inventory unknown. Verification permits this only for a verified no-CI project
@@ -71,6 +147,50 @@ requests zero project variables. No variable writes are made, and the report
 records `inventory_status: unavailable_ci_disabled` with verification based on
 the new project and the absence of variable writes. Requested project variables,
 native imports, and projects with CI still require normal variable API access.
+
+## CI API access while the project is quarantined
+
+Some GitLab releases return HTTP 403 for variables, schedules, or job details
+while project CI is disabled, even with otherwise sufficient access. For a
+Git-copy project with CI jobs, this can block preparation after `runner_mrs` or
+later verification. A zero-variable declaration does not make these inventories
+optional when CI will be enabled.
+
+After IT has excluded external triggers, other operators, and policy-injected
+jobs for the entire command, opt in with `--ci-api-isolated`. This is a runtime
+attestation, not a saved manifest change. It enables a fallback only for HTTP 403
+from destination CI APIs in an existing, recorded Git-copy project. A token must
+still have the required API permissions; denial after the guarded retry blocks.
+
+The fallback adds a private journal and an owned `codex/ci-api-*` branch containing
+a CI file whose workflow rejects every pipeline. It selects that file while CI
+is disabled, temporarily enables the CI feature to access its APIs, checks that
+destination schedules are inactive, then performs the required reconciliation or
+read. It never submits a pipeline. Cleanup disables CI **before** restoring the
+original CI configuration path. The guard branch is retained and excluded from
+Git comparison only after its ownership and exact commit are verified. Keep its
+`ci-api-owned-*.json` records and `ci-api-journal-*.json` with the run state.
+Interrupted settings are recovered before further migration work, even when the
+recovery command omits the opt-in. Failed recovery blocks further work.
+
+For an already copied project, keep the same run and state directory:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated --ci-api-isolated
+# Review and merge any generated CI preparation MRs before the smoke check.
+uv run --locked git-migrate verify RUN_ID \
+  --run-smoke --smoke-isolated --ci-api-isolated
+uv run --locked git-migrate activate RUN_ID \
+  --source-frozen --ci-api-isolated
+```
+
+The flag is also available on `apply` for new runs. Reattest on each command that
+needs guarded API access. `--ci-api-isolated` does not authorize a smoke pipeline;
+`--run-smoke --smoke-isolated` remains required for that. Verification still reads
+real variable/schedule inventories and completed smoke-job evidence. Activation
+repeats the checks before enabling the project's original CI. Do not manually
+enable project CI or start another `apply` to get around a blocked existing run.
 
 ## Plan and run
 

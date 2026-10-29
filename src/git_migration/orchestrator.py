@@ -6,10 +6,11 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from git_migration.providers import ProviderError, clients_for
 from git_migration.providers.gitlab import GitLabProvider
 from git_migration.secrets import SafeError, safe_error
 from git_migration.state import StateStore, atomic_json, utc_now
+from git_migration.steps.ci_access import owned_ci_api_refs, recover_ci_api, with_ci_api
 from git_migration.steps.environments import reconcile_environments
 from git_migration.steps.pages import reconcile_pages
 from git_migration.steps.preflight import encoded, ensure_groups, unmapped_ancestor_variables
@@ -54,8 +56,11 @@ class Migrator:
         run_id: str,
         source: Any = None,
         destination: Any = None,
+        *,
+        ci_api_isolated: bool = False,
     ) -> None:
         self.plan, self.store, self.run_id = plan, store, run_id
+        self.ci_api_isolated = ci_api_isolated
         self._source: Any
         self._destination: Any
         self._source, self._destination = (
@@ -102,10 +107,16 @@ class Migrator:
     @contextmanager
     def _operation(self) -> Iterator[None]:
         with self.store.lock():
+            if self.store.plan(self.run_id).config_hash != self.plan.config_hash:
+                raise MigrationBlocked(
+                    "Saved configuration changed; reload the run before retrying"
+                )
             if self.store.report(self.run_id)["status"] == "active":
                 raise MigrationBlocked("Run is already active; use report to inspect it")
             self._cancel.clear()
             try:
+                for repo in self.plan.config.repositories:
+                    recover_ci_api(self.destination, self._directory(repo))
                 self._recover_activation()
                 yield
             except BaseException as error:
@@ -212,7 +223,12 @@ class Migrator:
                 return True
             strategy: DirectTransferStrategy | FileExportStrategy | GitCopyStrategy
             if repo.strategy == "git_copy":
-                strategy = GitCopyStrategy(self.source, self.destination, directory)
+                strategy = GitCopyStrategy(
+                    self.source,
+                    self.destination,
+                    directory,
+                    skip_merge_request_history=repo.skip_merge_request_history,
+                )
             elif repo.strategy == "direct_transfer":
                 strategy = DirectTransferStrategy(self.source, self.destination, directory)
             else:
@@ -339,13 +355,21 @@ class Migrator:
         self, repo: Repository, source_id: int, target_id: int, *, write: bool, no_ci: bool = False
     ) -> dict:
         if self.plan.config.variables.mode == "project_explicit":
-            try:
+
+            def reconcile() -> dict:
                 return reconcile_explicit_variables(
                     self.destination,
                     target_id,
                     repo.ci_variables,
                     write=write,
                     receipt_path=self._directory(repo) / "variable-receipts.json",
+                )
+
+            try:
+                return (
+                    reconcile()
+                    if no_ci and not repo.ci_variables
+                    else self._ci_api(repo, reconcile)
                 )
             except ProviderError as error:
                 if (
@@ -370,6 +394,36 @@ class Migrator:
         return action(
             self.source, self.destination, "project", source_id, target_id, repo.variable_overrides
         )
+
+    def _ci_api(self, repo: Repository, action: Callable[[], Any]) -> Any:
+        try:
+            return action()
+        except ProviderError as error:
+            if error.status_code != 403 or repo.strategy != "git_copy":
+                raise
+            if not self.ci_api_isolated:
+                raise MigrationBlocked(
+                    "Destination CI API returned HTTP 403 while CI is quarantined. Check token "
+                    "access; if disabled CI blocks the API, use --ci-api-isolated only after IT "
+                    "excludes external triggers and policy-injected jobs. Keep this run and resume it"
+                ) from None
+        target = self._target(repo)
+        try:
+            result = with_ci_api(self.destination, target["id"], self._directory(repo), action)
+        except BaseException as error:
+            self._save(
+                repo,
+                "ci_api_access",
+                "failed",
+                {
+                    "error": safe_error(error)
+                    if isinstance(error, Exception)
+                    else "CI API access interrupted; retain isolation and resume recovery"
+                },
+            )
+            raise
+        self._save(repo, "ci_api_access", "complete", {"ci_restored_disabled": True})
+        return result
 
     def _target(self, repo: Repository) -> dict[str, Any]:
         imported = self._step(repo, "import")
@@ -412,6 +466,8 @@ class Migrator:
                     self._directory(repo),
                     expected_refs=baseline["data"]["snapshot"],
                     user_mapping=self.plan.config.user_mapping,
+                    skip_merge_request_history=repo.strategy == "git_copy"
+                    and repo.skip_merge_request_history,
                 )
                 self._save(
                     repo,
@@ -431,6 +487,8 @@ class Migrator:
                     self._directory(repo),
                     expected_refs=baseline["data"]["snapshot"],
                     user_mapping=self.plan.config.user_mapping,
+                    skip_merge_request_history=repo.strategy == "git_copy"
+                    and repo.skip_merge_request_history,
                 )
                 self._save(
                     repo,
@@ -569,12 +627,31 @@ class Migrator:
             self._failed(repo, "preparation", error)
             return False
 
-    def prepare(self) -> dict[str, Any]:
+    def prepare(self, runner_tag_map: dict[str, list[str]] | None = None) -> dict[str, Any]:
         if self.plan.blocked:
             raise MigrationBlocked("Resolve plan blockers before applying")
         with self._operation():
+            smoke_attempted = (
+                any(
+                    any(self._directory(repo).glob("smoke-*.json"))
+                    for repo in self.plan.config.repositories
+                )
+                if runner_tag_map
+                else False
+            )
             self._recover_smokes()
             self._check_environment()
+            if runner_tag_map:
+                if smoke_attempted and any(
+                    self.plan.config.runners.tag_map.get(tag) != targets
+                    for tag, targets in runner_tag_map.items()
+                ):
+                    raise MigrationBlocked(
+                        "Runner tag correction refused: smoke recovery or ownership evidence already exists"
+                    )
+                self.plan = self.store.revise_runner_tags(
+                    self.run_id, runner_tag_map, self.plan.config_hash
+                )
             ensure_groups(self.plan, self.destination)
             imported = self._parallel(self._import, self.plan.config.repositories)
             group_ready = self._groups()
@@ -644,6 +721,10 @@ class Migrator:
         if owned["blockers"]:
             raise MigrationBlocked("; ".join(owned["blockers"]))
         ignored_refs.update(owned["refs"])
+        guard = owned_ci_api_refs(self.destination, target["id"], self._directory(repo))
+        if guard["blockers"]:
+            raise MigrationBlocked("; ".join(guard["blockers"]))
+        ignored_refs.update(guard["refs"])
         return snapshot, ignored_refs, ignored_mrs, jobs
 
     def _verify(self, repo: Repository, run_smoke: bool = False) -> bool:
@@ -661,8 +742,11 @@ class Migrator:
                 and not jobs
                 and all(item.get("status") == "no_ci" for item in requests)
             )
-            schedules = self._destination_schedules(
-                target, allow_ci_disabled=no_ci and not self.plan.config.features.schedules
+            schedules = self._ci_api(
+                repo,
+                lambda: self._destination_schedules(
+                    target, allow_ci_disabled=no_ci and not self.plan.config.features.schedules
+                ),
             )
             if schedules is not None and any(item.get("active") for item in schedules):
                 raise MigrationBlocked(
@@ -687,6 +771,10 @@ class Migrator:
                     raise MigrationBlocked("; ".join(schedule_check["blockers"]))
             baseline = self._step(repo, "snapshot")
             assert baseline is not None
+            guard = owned_ci_api_refs(self.destination, target["id"], self._directory(repo))
+            if guard["blockers"]:
+                raise MigrationBlocked("; ".join(guard["blockers"]))
+            ignored_refs.update(guard["refs"])
             current_source = snapshot_repository(self.source, source_project, self._directory(repo))
             if current_source != baseline["data"]["snapshot"]:
                 raise MigrationBlocked("Source repository changed after the frozen snapshot")
@@ -700,6 +788,8 @@ class Migrator:
                 ignored_refs=ignored_refs,
                 ignored_mr_iids=ignored_mrs,
                 user_mapping=self.plan.config.user_mapping,
+                skip_merge_request_history=repo.strategy == "git_copy"
+                and repo.skip_merge_request_history,
                 require_identity_mapping=self.plan.config.compatibility.mode
                 == "experimental_direct_transfer",
             )
@@ -744,7 +834,16 @@ class Migrator:
                     protected_ref=protected,
                     strict=runner_profile.enforcement == "job_eligibility",
                 )
-                result["blockers"].extend(check["blockers"])
+                names = sorted(
+                    {
+                        job.get("job", "unknown")
+                        for job in jobs
+                        if tuple(job["tags"]) == tags and job["protected_ref"] == protected
+                    }
+                )
+                result["blockers"].extend(
+                    f"Jobs {', '.join(names)}: {message}" for message in check["blockers"]
+                )
             ref_digest = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
             if jobs and run_smoke and not result["blockers"]:
                 from git_migration.steps.smoke import run_smoke as execute_smoke
@@ -756,6 +855,7 @@ class Migrator:
                     self._directory(repo),
                     marker=f"migration-{self.run_id}",
                     required_tag_sets=[list(tags) for tags in tag_sets],
+                    schedules_verified=self.ci_api_isolated and schedules is not None,
                 )
                 smoke_result["ref_digest"] = ref_digest
                 self._save(
@@ -772,11 +872,19 @@ class Migrator:
                     or not smoke["data"].get("jobs")
                     or smoke["data"].get("ref_digest") != ref_digest
                 ):
-                    result["blockers"].append("Run verify --run-smoke after merging the runner MRs")
+                    result["blockers"].append(
+                        "Smoke evidence is missing; resolve the blockers above before rerunning verify --run-smoke --smoke-isolated"
+                        if result["blockers"]
+                        else "Run verify --run-smoke --smoke-isolated to record runner smoke evidence"
+                    )
                 else:
                     for evidence in smoke["data"].get("jobs", []):
-                        job = self.destination.get(
-                            f"/projects/{target['id']}/jobs/{evidence['job_id']}"
+                        job = self._ci_api(
+                            repo,
+                            partial(
+                                self.destination.get,
+                                f"/projects/{target['id']}/jobs/{evidence['job_id']}",
+                            ),
                         )
                         result["blockers"].extend(
                             verify_runner_smoke(job, runner_profile.allowed_runner_ids)["blockers"]

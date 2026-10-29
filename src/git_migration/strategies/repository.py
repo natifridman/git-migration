@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from git_migration.git import GitError, repository_url, transport_for
+from git_migration.providers.contracts import Provider
 from git_migration.secrets import SafeError
 from git_migration.state import atomic_json
 
@@ -21,6 +22,17 @@ class GitCopyBlocked(SafeError):
 class GitCopyStrategy(_Base):
     """Never force-push, adopt an existing project, or invoke GitLab's importer."""
 
+    def __init__(
+        self,
+        source: Provider,
+        destination: Provider,
+        work_dir: Path,
+        *,
+        skip_merge_request_history: bool = False,
+    ) -> None:
+        super().__init__(source, destination, work_dir)
+        self.skip_merge_request_history = skip_merge_request_history
+
     @property
     def journal(self) -> Path:
         return self.work_dir / "git-copy.json"
@@ -28,11 +40,20 @@ class GitCopyStrategy(_Base):
     def _check_source(self, source_path: str) -> dict:
         project = self.source.project(source_path)
         for endpoint in ("issues", "merge_requests"):
-            if self.source.list(f"/projects/{project['id']}/{endpoint}", params={"state": "all"}):
+            records = self.source.list(
+                f"/projects/{project['id']}/{endpoint}", params={"state": "all"}
+            )
+            if records and not (endpoint == "merge_requests" and self.skip_merge_request_history):
                 raise GitCopyBlocked(
-                    "Source has issues or merge requests; choose a native transfer to preserve them"
+                    "Source has issues; choose a native transfer to preserve them"
+                    if self.skip_merge_request_history
+                    else "Source has issues or merge requests; choose a native transfer to preserve them"
                 )
         return project
+
+    def _check_history_policy(self, handle: dict) -> None:
+        if handle.get("skip_merge_request_history", False) != self.skip_merge_request_history:
+            raise GitCopyBlocked("Git copy history policy changed; retain the saved run policy")
 
     def start(self, source_path: str, destination_path: str) -> dict:
         if self.journal.exists():
@@ -48,6 +69,8 @@ class GitCopyStrategy(_Base):
             "snapshot": snapshot,
             "status": "creating",
         }
+        if self.skip_merge_request_history:
+            handle["skip_merge_request_history"] = True
         # Record intent before creation. An uncertain response cannot be recovered
         # by assuming that the project currently at this path belongs to our run.
         atomic_json(self.journal, handle)
@@ -81,6 +104,7 @@ class GitCopyStrategy(_Base):
         if not self.journal.exists():
             return None
         handle = json.loads(self.journal.read_text())
+        self._check_history_policy(handle)
         if (
             handle.get("source_path") != source_path
             or handle.get("destination_path") != destination_path
@@ -93,6 +117,7 @@ class GitCopyStrategy(_Base):
         return handle
 
     def poll(self, handle: dict) -> TransferProgress:
+        self._check_history_policy(handle)
         source_project = self._check_source(handle["source_path"])
         if source_project["id"] != handle["source_id"]:
             raise GitCopyBlocked("Source project identity changed")

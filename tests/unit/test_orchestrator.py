@@ -138,6 +138,131 @@ def test_prepare_checkpoints_snapshot_and_resumes_without_duplicate_import(
     assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
 
 
+def test_runner_tag_correction_recovers_same_mr_and_still_requires_review(migration, monkeypatch):
+    original, store, _, source, target, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    jobs = [{"job": "check", "tags": ["old-linux"]}]
+    remote_requests = []
+    attempts = []
+
+    def prepare_mr(destination, project_id, branch, tag_map, **kwargs):
+        assert destination.builds_access_level == "disabled"
+        if not tag_map:
+            return {"status": "unchanged", "changed": False, "jobs": jobs, "blockers": []}
+        assert tag_map == {"old-linux": ["approved"]}
+        attempts.append(dict(tag_map))
+        if not remote_requests:
+            remote_requests.append(
+                {
+                    "status": "created",
+                    "iid": 21,
+                    "changed": True,
+                    "source_branch": "codex/runner-migration-synthetic",
+                    "commit_sha": "b" * 40,
+                    "jobs": [{"job": "check", "tags": ["approved"]}],
+                    "blockers": [],
+                }
+            )
+            raise ProviderError(503)  # The response is lost after the remote write.
+        return dict(remote_requests[0])
+
+    monkeypatch.setattr(orchestrator, "prepare_runner_merge_request", prepare_mr)
+    migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    stale = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    before_import = store.step(run, "team/repo", "import")
+    changes = {"old-linux": ["approved"]}
+    assert migrator.prepare(changes)["status"] == "blocked"
+    assert store.step(run, "team/repo", "runner_mrs")["status"] == "superseded"
+    with pytest.raises(orchestrator.MigrationBlocked, match="Saved configuration changed"):
+        stale.prepare()
+    resumed = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert resumed.prepare(changes)["status"] == "awaiting_verification"
+    assert attempts == [changes, changes]
+    assert len(remote_requests) == 1
+    assert strategy.starts == strategy.polls == 1
+    assert store.step(run, "team/repo", "import") == before_import
+    assert store.step(run, "team/repo", "preparation")["data"]["awaiting_review"]
+    target.mr = {
+        "state": "opened",
+        "source_branch": remote_requests[0]["source_branch"],
+        "target_branch": "main",
+        "sha": "b" * 40,
+    }
+    assert resumed.verify(run_smoke=True)["status"] == "blocked"
+    assert "reviewed and merged" in store.step(run, "team/repo", "verification")["data"]["error"]
+    assert resumed.activate()["status"] == "blocked"
+    assert store.step(run, "team/repo", "smoke") is None
+    assert target.builds_access_level == "disabled"
+    assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
+
+
+@pytest.mark.parametrize("record", ["smoke-journal-20.json", "smoke-owned-20-synthetic.json"])
+def test_tag_correction_recovers_but_refuses_uncheckpointed_smoke(migration, monkeypatch, record):
+    original, store, _, source, target, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "unchanged",
+            "changed": False,
+            "blockers": [],
+            "jobs": [{"job": "check", "tags": ["old-linux"]}],
+        },
+    )
+    migrator = orchestrator.Migrator(plan, store, run, source, target)
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    evidence = migrator._directory(plan.config.repositories[0]) / record
+    evidence.write_text("{}")
+    recovered = []
+
+    def recovery(self):
+        recovered.append(True)
+        if "journal" in record:
+            evidence.unlink()  # Successful restoration removes the recovery journal.
+
+    monkeypatch.setattr(orchestrator.Migrator, "_recover_smokes", recovery)
+    with pytest.raises(orchestrator.MigrationBlocked, match="smoke recovery or ownership"):
+        migrator.prepare({"old-linux": ["approved"]})
+    assert recovered == [True]
+    assert store.plan(run) == plan
+    assert store.step(run, "team/repo", "runner_tag_revision_1") is None
+    assert strategy.starts == 1
+
+
+def test_runner_blocker_identifies_job_and_does_not_claim_uncreated_mrs(
+    tagged_migration, monkeypatch
+):
+    migrator, _ = tagged_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_runner_configuration",
+        lambda *args, **kwargs: {
+            "jobs": [{"job": "check", "tags": ["old-linux"]}],
+            "blockers": [],
+        },
+    )
+    assert migrator.verify(run_smoke=True)["status"] == "blocked"
+    blockers = migrator.store.step(migrator.run_id, "team/repo", "verification")["data"]["blockers"]
+    assert any(
+        "Jobs check:" in message and "required tags: ['old-linux']" in message
+        for message in blockers
+    )
+    assert any("resolve the blockers above" in message for message in blockers)
+    assert all("merging the runner MRs" not in message for message in blockers)
+    assert migrator.store.step(migrator.run_id, "team/repo", "smoke") is None
+
+
 def test_git_copy_runs_without_pilot_and_no_ci_stays_disabled(migration, monkeypatch):
     migrator, store, _, source, target, strategy = migration
     plan = migrator.plan.model_copy(deep=True)
@@ -145,11 +270,69 @@ def test_git_copy_runs_without_pilot_and_no_ci_stays_disabled(migration, monkeyp
     plan.source_version, plan.destination_version = "19.6.0-pre", "19.2.7-ee"
     plan.config_hash = plan.config.fingerprint()
     run = store.create_run(plan)
-    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args: strategy)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
     migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
     assert migrator.prepare()["status"] == "awaiting_verification"
     assert migrator.verify()["status"] == "verified"
     assert migrator.activate()["status"] == "active"
+    assert target.builds_access_level == "disabled"
+    assert strategy.starts == 1
+
+
+@pytest.mark.parametrize("new_issue", [False, True])
+def test_git_copy_mr_omission_survives_retry_resume_and_activation(
+    migration,
+    monkeypatch,
+    capsys,
+    new_issue,
+):
+    from git_migration.reporting import show_report
+    from git_migration.steps import verify
+
+    original, store, _, source, target, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config.repositories[0].skip_merge_request_history = True
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+    snapshot = {"refs": {"refs/heads/main": "a" * 40}, "default_branch": "main", "lfs_oids": []}
+    monkeypatch.setattr(verify, "snapshot_repository", lambda *args: snapshot)
+    monkeypatch.setattr(orchestrator, "verify_repository", verify.verify_repository)
+
+    def selected_strategy(*args, **kwargs):
+        assert kwargs["skip_merge_request_history"] is True
+        return strategy
+
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", selected_strategy)
+    unavailable = True
+    issues = []
+
+    def source_list(path, params=None):
+        if path.endswith("/merge_requests"):
+            if unavailable:
+                raise ProviderError(403)
+            return [{"iid": 1, "state": "merged"}]
+        if path.endswith("/issues"):
+            return issues
+        return []
+
+    source.list = source_list
+    migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert migrator.prepare()["status"] == "blocked"
+    assert store.step(run, "team/repo", "baseline_verified")["status"] == "failed"
+    unavailable = False
+    resumed = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert resumed.prepare()["status"] == "awaiting_verification"
+    assert strategy.starts == 1
+    baseline = store.step(run, "team/repo", "baseline_verified")["data"]
+    assert baseline["merge_requests"]["status"] == "omitted"
+    report = resumed.verify()
+    assert report["status"] == "verified"
+    show_report(report)
+    assert "MR history omitted: 1 source merge requests" in capsys.readouterr().out
+    if new_issue:
+        issues.append({"iid": 2, "title": "New issue"})
+    assert resumed.activate()["status"] == ("blocked" if new_issue else "active")
     assert target.builds_access_level == "disabled"
     assert strategy.starts == 1
 
@@ -188,7 +371,7 @@ def test_no_ci_git_copy_with_no_requested_variables_handles_disabled_variable_ap
     repo = migrator.plan.config.repositories[0]
     repo.strategy = "git_copy"
     migrator.plan.config.variables = VariablePolicy(mode="project_explicit")
-    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args: strategy)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
     monkeypatch.setattr(orchestrator, "verify_destination_inheritance", lambda *args: None)
     original_list = target.list
 
@@ -206,6 +389,130 @@ def test_no_ci_git_copy_with_no_requested_variables_handles_disabled_variable_ap
     assert migrator.activate()["status"] == "active"
     assert all(not path.endswith("/variables") for path, _ in target.writes)
     assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
+
+
+@pytest.mark.parametrize("activation_fault", [None, "variables", "schedules"])
+def test_ci_api_quarantine_resumes_existing_copy_and_requires_verified_activation(
+    migration,
+    monkeypatch,
+    activation_fault,
+):
+    from test_smoke import Destination
+
+    from git_migration.models import VariablePolicy
+    from git_migration.steps import smoke, verify
+
+    original, store, _, source, _, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config.variables = VariablePolicy(mode="project_explicit")
+    plan.config.runners.enforcement = "job_eligibility"
+    plan.config.runners.allowed_runner_ids = [12]
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+
+    class Target(Destination):
+        def __init__(self):
+            super().__init__()
+            self.settings.update(id=20, path_with_namespace="new/repo", auto_devops_enabled=False)
+            self.extra_variable = False
+
+        def list(self, path, params=None):
+            if path.endswith(("/variables", "/pipeline_schedules")):
+                if self.settings["builds_access_level"] == "disabled":
+                    raise ProviderError(403)
+            if path.endswith("/variables"):
+                return [{"key": "EXTRA", "value": "synthetic"}] if self.extra_variable else []
+            if path.endswith(("/merge_requests", "/issues")):
+                return []
+            return super().list(path.replace("/projects/20/", "/projects/1/"), params)
+
+        def get(self, path, params=None):
+            if "/jobs/" in path:
+                if self.settings["builds_access_level"] == "disabled":
+                    raise ProviderError(403)
+                return {
+                    "id": 70,
+                    "status": "success",
+                    "finished_at": "2026-10-29T00:00:00Z",
+                    "runner": {"id": 12},
+                    "pipeline": {"id": 60},
+                    "commit": {"id": "probe-sha"},
+                    "ref": "codex/probe",
+                }
+            return super().get(path.replace("/projects/20/", "/projects/1/"), params)
+
+    target = Target()
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    monkeypatch.setattr(orchestrator, "verify_destination_inheritance", lambda *args: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "unchanged",
+            "source_sha": "base-sha",
+            "jobs": [{"tags": ["linux"]}],
+            "blockers": [],
+            "changed": False,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_runner_configuration",
+        lambda *args, **kwargs: {"jobs": [{"tags": ["linux"]}], "blockers": []},
+    )
+
+    def snapshot(provider, project, directory):
+        refs = {"refs/heads/main": "base-sha"}
+        if provider is target and target.branch:
+            refs["refs/heads/" + target.branch] = "smoke-sha"
+        return {"refs": refs, "default_branch": "main", "lfs_oids": []}
+
+    monkeypatch.setattr(orchestrator, "snapshot_repository", snapshot)
+    monkeypatch.setattr(verify, "snapshot_repository", snapshot)
+    monkeypatch.setattr(orchestrator, "verify_repository", verify.verify_repository)
+
+    def probe(*args, **kwargs):
+        assert kwargs["schedules_verified"] is True
+        assert target.settings["builds_access_level"] == "disabled"
+        return {
+            "blockers": [],
+            "jobs": [
+                {
+                    "job_id": 70,
+                    "pipeline_id": 60,
+                    "commit_sha": "probe-sha",
+                    "branch": "codex/probe",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(smoke, "run_smoke", probe)
+    migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert migrator.prepare()["status"] == "blocked"
+    assert not target.branch  # No guard or feature enablement without the explicit flag.
+    resumed = orchestrator.Migrator(
+        store.plan(run),
+        store,
+        run,
+        source,
+        target,
+        ci_api_isolated=True,
+    )
+    assert resumed.prepare()["status"] == "awaiting_verification"
+    assert strategy.starts == 1
+    assert target.settings["builds_access_level"] == "disabled"
+    assert resumed.verify()["status"] == "blocked"  # Still needs a real isolated smoke.
+    assert resumed.verify(run_smoke=True)["status"] == "verified"
+    assert target.settings["builds_access_level"] == "disabled"
+    assert store.step(run, "team/repo", "ci_api_access")["data"]["ci_restored_disabled"]
+    target.extra_variable = activation_fault == "variables"
+    target.active_schedule = activation_fault == "schedules"
+    assert resumed.activate()["status"] == ("blocked" if activation_fault else "active")
+    assert target.settings["builds_access_level"] == ("disabled" if activation_fault else "enabled")
+    if activation_fault:
+        assert "ci_restored_disabled" not in store.step(run, "team/repo", "ci_api_access")["data"]
+    assert strategy.starts == 1
 
 
 @pytest.mark.parametrize(
@@ -233,7 +540,7 @@ def test_disabled_variable_api_fallback_is_limited_to_empty_no_ci_git_copy(
         raise ProviderError(401 if fault == "unauthorized" else 403)
 
     monkeypatch.setattr(target, "list", unavailable)
-    with pytest.raises(ProviderError):
+    with pytest.raises((ProviderError, orchestrator.MigrationBlocked)):
         migrator._variables(repo, 10, 20, write=True, no_ci=fault != "ci_present")
 
 

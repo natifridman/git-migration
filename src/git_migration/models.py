@@ -84,12 +84,19 @@ class Repository(Model):
     source_path: str
     destination_path: str
     strategy: Literal["direct_transfer", "file_export", "git_copy"] = "direct_transfer"
+    skip_merge_request_history: bool = False
     ci_branches: list[str] = Field(default_factory=list)
     variable_overrides: dict[str, str] = Field(default_factory=dict)
     ci_variables: list[CIVariable] = Field(default_factory=list)
     schedule_activation_ids: list[int] = Field(default_factory=list)
 
     _paths = field_validator("source_path", "destination_path")(project_path)
+
+    @model_validator(mode="after")
+    def validate_history_policy(self) -> Repository:
+        if self.skip_merge_request_history and self.strategy != "git_copy":
+            raise ValueError("skip_merge_request_history requires git_copy strategy")
+        return self
 
     @field_validator("ci_variables")
     @classmethod
@@ -262,6 +269,8 @@ class MigrationConfig(Model):
         for repository in data["repositories"]:
             if not repository["ci_variables"]:
                 repository.pop("ci_variables")
+            if not repository["skip_merge_request_history"]:
+                repository.pop("skip_merge_request_history")
         payload = json.dumps(data, sort_keys=True).encode()
         return hashlib.sha256(payload).hexdigest()
 

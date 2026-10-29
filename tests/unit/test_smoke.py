@@ -1,5 +1,7 @@
 import base64
 
+import pytest
+
 from git_migration.providers import ProviderError
 from git_migration.state import atomic_json
 from git_migration.steps.smoke import recover_smoke, run_smoke
@@ -125,6 +127,9 @@ def test_safe_smoke_each_tag_set_and_cleanup_order(tmp_path):
     assert result["status"] == "passed"
     assert len(result["jobs"]) == 2
     assert result["commit_sha"] == "smoke-sha"
+    assert all(job["pipeline_id"] == 60 for job in result["jobs"])
+    assert all(job["commit_sha"] == result["commit_sha"] for job in result["jobs"])
+    assert all(job["branch"] == result["branch"] for job in result["jobs"])
     assert destination.settings["builds_access_level"] == "disabled"
     assert destination.settings["ci_config_path"] is None
     assert destination.changes[-2][2] == {"builds_access_level": "disabled"}
@@ -174,6 +179,38 @@ def test_active_schedule_blocks_without_mutation(tmp_path):
     result = run_smoke(destination, {"id": 1}, {"allowed_runner_ids": [12]}, tmp_path, "pilot")
     assert "schedule" in str(result["blockers"])
     assert destination.changes == []
+
+
+@pytest.mark.parametrize("became_active", [False, True])
+def test_disabled_schedule_api_requires_prior_guard_check_and_rechecks_before_pipeline(
+    tmp_path,
+    became_active,
+):
+    destination = Destination()
+    original_list = destination.list
+
+    def schedules(path, params=None):
+        if path.endswith("/pipeline_schedules"):
+            if destination.settings["builds_access_level"] == "disabled":
+                raise ProviderError(403)
+            return [{"active": True}] if became_active else []
+        return original_list(path, params)
+
+    destination.list = schedules
+    with pytest.raises(ProviderError):
+        run_smoke(destination, {"id": 1}, {"allowed_runner_ids": [12]}, tmp_path, "pilot")
+    assert not destination.changes
+    result = run_smoke(
+        destination,
+        {"id": 1},
+        {"allowed_runner_ids": [12]},
+        tmp_path,
+        "pilot",
+        schedules_verified=True,
+    )
+    assert result["status"] == ("blocked" if became_active else "passed")
+    assert destination.pipeline_posts == (0 if became_active else 1)
+    assert destination.settings["builds_access_level"] == "disabled"
 
 
 def test_enabled_builds_refused_without_mutation(tmp_path):

@@ -110,7 +110,11 @@ def inspect_runners(
     online = {r["id"] for r in details if r.get("status") == "online"}
     blockers = []
     if not set(eligible) & allowed:
-        blockers.append("No approved runner can execute this job configuration")
+        blockers.append(
+            "No approved runner can execute this job configuration "
+            f"(required tags: {list(tags)}, protected ref: {bool(protected_ref)}); "
+            "check job tag mapping, runner availability, paused state and protected access"
+        )
     if set(eligible) & allowed and not set(eligible) & allowed & online:
         blockers.append("Approved matching runners are currently offline")
     if set(eligible) - allowed:

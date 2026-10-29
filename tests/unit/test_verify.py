@@ -94,6 +94,78 @@ class VerifyTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "blocked")
 
+    def test_opt_in_records_omission_and_only_excludes_owned_destination_mrs(self):
+        source = Provider([{"iid": 2, "title": "private title", "state": "merged"}])
+        target = Provider([{"iid": 42}])
+        result = verify_merge_requests(
+            source,
+            target,
+            self.project,
+            self.project,
+            ignored_mr_iids={42},
+            skip_merge_request_history=True,
+        )
+        self.assertEqual(result["status"], "omitted")
+        self.assertEqual(result["omitted_count"], 1)
+        self.assertEqual(result["source_count"], 1)
+        self.assertEqual(result["target_count"], 0)
+        self.assertEqual(result["coverage"], [])
+        self.assertEqual(result["identities"], [])
+        self.assertNotIn("private title", str(result))
+        result = verify_merge_requests(
+            source,
+            target,
+            self.project,
+            self.project,
+            skip_merge_request_history=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+
+    def test_mr_omission_does_not_skip_git_lfs_or_issue_checks(self):
+        source = Provider([{"iid": 2}])
+        target = Provider()
+        original_list = source.list
+        source.list = lambda path, params=None: (
+            [{"iid": 1, "title": "issue"}]
+            if path.endswith("/issues")
+            else original_list(path, params)
+        )
+        changed = dict(self.snapshot, refs={"refs/heads/main": "b" * 40}, lfs_oids=["1" * 64])
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch("git_migration.steps.verify.snapshot_repository", return_value=changed),
+        ):
+            result = verify_repository(
+                source,
+                target,
+                self.project,
+                self.project,
+                Path(folder),
+                self.snapshot,
+                skip_merge_request_history=True,
+            )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("Branch or tag names/object identifiers differ", result["blockers"])
+        self.assertIn("LFS object identifiers differ", result["blockers"])
+        self.assertTrue(result["issues"]["blockers"])
+        self.assertEqual(result["merge_requests"]["status"], "omitted")
+
+    def test_mr_omission_still_requires_readable_inventory(self):
+        class Unreadable(Provider):
+            def list(self, path, params=None):
+                raise RuntimeError("private remote error")
+
+        result = verify_merge_requests(
+            Unreadable(),
+            Provider(),
+            self.project,
+            self.project,
+            skip_merge_request_history=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIsNone(result["source_count"])
+        self.assertNotIn("private remote error", str(result))
+
     def test_iid_mapping_and_placeholder_warning(self):
         mr = {"iid": 2, "title": "fix", "source_branch": "topic", "target_branch": "main"}
         result = verify_merge_requests(
