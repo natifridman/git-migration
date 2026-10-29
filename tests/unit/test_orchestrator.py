@@ -1019,7 +1019,7 @@ def test_version_change_on_resume_stops_before_new_remote_writes(
 ) -> None:
     from git_migration.compatibility import CompatibilityBlocked, endpoint_snapshot
 
-    migrator, _, _, source, target, strategy = migration
+    migrator, store, _, source, target, strategy = migration
     monkeypatch.setattr(
         source, "version", lambda: {"version": "18.4.1", "revision": "a" * 40}, raising=False
     )
@@ -1027,6 +1027,8 @@ def test_version_change_on_resume_stops_before_new_remote_writes(
         target, "version", lambda: {"version": "18.4.1", "revision": "b" * 40}, raising=False
     )
     migrator.plan.endpoint_snapshot = endpoint_snapshot(migrator.plan.config, source, target)
+    run = store.create_run(migrator.plan)
+    migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
     assert migrator.prepare()["status"] == "awaiting_verification"
     monkeypatch.setattr(target, "version", lambda: {"version": "18.4.1", "revision": "c" * 40})
     target.writes.clear()
@@ -1034,6 +1036,345 @@ def test_version_change_on_resume_stops_before_new_remote_writes(
         migrator.prepare()
     assert not target.writes
     assert strategy.starts == 1
+
+
+@pytest.fixture
+def endpoint_migration(migration, monkeypatch):
+    from git_migration.compatibility import endpoint_snapshot
+
+    original, store, _, source, target, strategy = migration
+    live = {
+        "source": {"version": "18.4.1", "revision": "a" * 40},
+        "destination": {"version": "18.4.1", "revision": "b" * 40},
+    }
+    monkeypatch.setattr(source, "version", lambda: live["source"], raising=False)
+    monkeypatch.setattr(target, "version", lambda: live["destination"], raising=False)
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config_hash = plan.config.fingerprint()
+    plan.endpoint_snapshot = endpoint_snapshot(plan.config, source, target)
+    run = store.create_run(plan)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    return orchestrator.Migrator(plan, store, run, source, target), source, target, strategy, live
+
+
+@pytest.mark.parametrize(
+    "side,field,value",
+    [
+        ("source", "revision", "c" * 40),
+        ("destination", "revision", "c" * 40),
+        ("source", "version", "18.5.0-pre"),
+        ("destination", "version", "18.4.2-ee"),
+    ],
+)
+def test_git_copy_endpoint_drift_still_blocks_until_explicit_refresh(
+    endpoint_migration, side, field, value
+):
+    from git_migration.compatibility import CompatibilityBlocked
+
+    migrator, source, target, strategy, live = endpoint_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    store, run = migrator.store, migrator.run_id
+    frozen = {
+        name: store.step(run, "team/repo", name) for name in ("snapshot", "import", "runner_mrs")
+    }
+    stale = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    stale_plan = store.plan(run)
+    live[side][field] = value
+    target.writes.clear()
+    with pytest.raises(CompatibilityBlocked, match=f"{side} {field}"):
+        migrator.verify()
+    assert not target.writes
+    assert store.endpoint_generation(run) == 0
+    assert migrator.verify(refresh_endpoints=True)["status"] == "verified"
+    assert store.endpoint_generation(run) == 1
+    assert not target.writes  # No-CI verification needs no remote mutations.
+    assert {name: store.step(run, "team/repo", name) for name in frozen} == frozen
+    with pytest.raises(orchestrator.MigrationBlocked, match="Saved endpoints changed"):
+        stale.verify()
+    # The CLI may load its plan before another process refreshes, then construct afterward.
+    late_constructed = orchestrator.Migrator(stale_plan, store, run, source, target)
+    with pytest.raises(orchestrator.MigrationBlocked, match="Saved endpoints changed"):
+        late_constructed.verify()
+    restarted = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert restarted.verify()["status"] == "verified"
+    assert strategy.starts == strategy.polls == 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["ci_enabled", "identity_changed", "data_changed", "endpoint_changed_during_verification"],
+)
+def test_endpoint_refresh_keeps_quarantine_identity_and_data_gates(
+    endpoint_migration, monkeypatch, fault
+):
+    from git_migration.compatibility import CompatibilityBlocked
+
+    migrator, _, target, strategy, live = endpoint_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    live["source"]["revision"] = "c" * 40
+    if fault == "ci_enabled":
+        target.builds_access_level = "enabled"
+    elif fault == "identity_changed":
+        original_project = target.project
+        monkeypatch.setattr(target, "project", lambda path: {**original_project(path), "id": 99})
+    else:
+
+        def verification(*args, **kwargs):
+            if fault == "endpoint_changed_during_verification":
+                live["source"]["revision"] = "d" * 40
+            return {
+                "warnings": [],
+                "blockers": ["Git data mismatch"] if fault == "data_changed" else [],
+            }
+
+        monkeypatch.setattr(orchestrator, "verify_repository", verification)
+    if fault == "data_changed":
+        assert migrator.verify(refresh_endpoints=True)["status"] == "blocked"
+    else:
+        with pytest.raises((CompatibilityBlocked, orchestrator.MigrationBlocked)):
+            migrator.verify(refresh_endpoints=True)
+    assert migrator.store.report(migrator.run_id)["status"] == "blocked"
+    assert migrator.store.endpoint_generation(migrator.run_id) == (
+        0 if fault in {"ci_enabled", "identity_changed"} else 1
+    )
+    assert strategy.starts == 1
+
+
+@pytest.mark.parametrize("option", ["refresh_endpoints", "allow_source_revision_drift"])
+def test_endpoint_refresh_preserves_mr_review_gate(endpoint_migration, option):
+    migrator, _, target, _, live = endpoint_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    request = {
+        "iid": 21,
+        "source_branch": "codex/config",
+        "target_branch": "main",
+        "source_sha": "a" * 40,
+        "commit_sha": "b" * 40,
+    }
+    migrator.store.save(
+        migrator.run_id, "team/repo", "runner_mrs", "complete", {"requests": [request]}
+    )
+    target.mr = {
+        "state": "opened",
+        "source_branch": "codex/config",
+        "target_branch": "main",
+        "sha": "b" * 40,
+    }
+    live["source"]["revision"] = "c" * 40
+    assert migrator.verify(**{option: True}, run_smoke=True)["status"] == "blocked"
+    assert (
+        "reviewed and merged"
+        in migrator.store.step(migrator.run_id, "team/repo", "verification")["data"]["error"]
+    )
+    assert target.builds_access_level == "disabled"
+
+
+def test_endpoint_refresh_requires_fresh_smoke_and_recovers_same_generation(
+    endpoint_migration, monkeypatch
+):
+    from git_migration.steps import smoke
+
+    migrator, source, target, strategy, live = endpoint_migration
+    jobs = [{"job": "check", "tags": ["approved"]}]
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "unchanged",
+            "source_sha": "a" * 40,
+            "jobs": jobs,
+            "blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_runner_configuration",
+        lambda *args, **kwargs: {"jobs": jobs, "blockers": []},
+    )
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    markers = []
+    fail = False
+    original_get = target.get
+
+    def get(path, params=None):
+        if path.endswith("/jobs/99"):
+            return {
+                "id": 99,
+                "status": "success",
+                "finished_at": "2026-10-21T00:00:00Z",
+                "runner": {"id": 7},
+                "pipeline": {"id": 88},
+                "commit": {"id": "b" * 40},
+                "ref": "codex/smoke",
+            }
+        return original_get(path, params)
+
+    def execute(*args, marker, **kwargs):
+        markers.append(marker)
+        if fail:
+            raise RuntimeError("Interrupted smoke")
+        return {
+            "blockers": [],
+            "jobs": [
+                {"job_id": 99, "pipeline_id": 88, "commit_sha": "b" * 40, "branch": "codex/smoke"}
+            ],
+        }
+
+    monkeypatch.setattr(target, "get", get)
+    monkeypatch.setattr(smoke, "run_smoke", execute)
+    assert migrator.verify(run_smoke=True)["status"] == "verified"
+    original_smoke = migrator.store.step(migrator.run_id, "team/repo", "smoke")
+    live["source"]["revision"] = "c" * 40
+    assert migrator.verify(refresh_endpoints=True)["status"] == "blocked"
+    assert migrator.store.step(migrator.run_id, "team/repo", "smoke")["status"] == "superseded"
+    assert migrator.activate()["status"] == "blocked"
+    assert target.builds_access_level == "disabled"
+    fail = True
+    assert migrator.verify(run_smoke=True)["status"] == "blocked"
+    fail = False
+    restarted = orchestrator.Migrator(
+        migrator.store.plan(migrator.run_id), migrator.store, migrator.run_id, source, target
+    )
+    assert restarted.verify(run_smoke=True, refresh_endpoints=True)["status"] == "verified"
+    assert markers == [
+        f"migration-{migrator.run_id}",
+        f"migration-{migrator.run_id}-endpoints-1",
+        f"migration-{migrator.run_id}-endpoints-1",
+    ]
+    audit = migrator.store.step(migrator.run_id, "run", "endpoint_revision_1")["data"]
+    assert original_smoke in audit["superseded_steps"]
+    assert restarted.activate()["status"] == "active"
+    assert target.builds_access_level == "enabled"
+    assert strategy.starts == 1
+
+
+def test_source_revision_drift_reuses_passed_smoke_and_audits_each_observation(
+    endpoint_migration, monkeypatch, capsys
+):
+    from itertools import cycle
+
+    from git_migration.compatibility import CompatibilityBlocked
+    from git_migration.reporting import show_report
+    from git_migration.steps import smoke
+
+    migrator, source, target, strategy, live = endpoint_migration
+    jobs = [{"job": "check", "tags": ["approved"]}]
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "unchanged",
+            "source_sha": "a" * 40,
+            "jobs": jobs,
+            "blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_runner_configuration",
+        lambda *args, **kwargs: {"jobs": jobs, "blockers": []},
+    )
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    original_get = target.get
+    smoke_calls = []
+
+    def get(path, params=None):
+        if path.endswith("/jobs/99"):
+            return {
+                "id": 99,
+                "status": "success",
+                "finished_at": "2026-10-21T00:00:00Z",
+                "runner": {"id": 7},
+                "pipeline": {"id": 88},
+                "commit": {"id": "b" * 40},
+                "ref": "codex/smoke",
+            }
+        return original_get(path, params)
+
+    def execute(*args, marker, **kwargs):
+        smoke_calls.append(marker)
+        live["source"]["revision"] = "d" * 40  # Source changed during the successful probe.
+        return {
+            "blockers": [],
+            "jobs": [
+                {"job_id": 99, "pipeline_id": 88, "commit_sha": "b" * 40, "branch": "codex/smoke"}
+            ],
+        }
+
+    monkeypatch.setattr(target, "get", get)
+    monkeypatch.setattr(smoke, "run_smoke", execute)
+    live["source"]["revision"] = "c" * 40
+    with pytest.raises(CompatibilityBlocked):
+        migrator.verify(run_smoke=True, refresh_endpoints=True)
+    store, run = migrator.store, migrator.run_id
+    old_smoke, old_plan = store.step(run, "team/repo", "smoke"), store.plan(run)
+    assert (
+        old_smoke["status"] == store.step(run, "team/repo", "verification")["status"] == "complete"
+    )
+    revisions = cycle(["d" * 40, "e" * 40])
+    monkeypatch.setattr(
+        source, "version", lambda: {"version": "18.4.1", "revision": next(revisions)}
+    )
+    restarted = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    report = restarted.verify(allow_source_revision_drift=True)
+    assert report["status"] == "verified"
+    assert store.step(run, "team/repo", "smoke") == old_smoke
+    observations = [
+        step for step in report["steps"] if step["name"].startswith("source_revision_observation_")
+    ]
+    assert len(observations) == 2
+    assert {
+        step["data"]["observed_endpoint_snapshot"]["source"]["revision"] for step in observations
+    } == {"d" * 40, "e" * 40}
+    assert all(
+        step["data"]["planned_endpoint_snapshot"] == old_plan.endpoint_snapshot
+        for step in observations
+    )
+    show_report(report)
+    assert "Accepted source build revision" in capsys.readouterr().out
+    with pytest.raises(CompatibilityBlocked):
+        restarted.activate()  # An earlier observation does not authorize later commands.
+    assert target.builds_access_level == "disabled"
+    assert restarted.activate(allow_source_revision_drift=True)["status"] == "active"
+    assert target.builds_access_level == "enabled"
+    assert store.endpoint_generation(run) == 1
+    assert store.plan(run) == old_plan
+    assert (
+        len(
+            [
+                step
+                for step in store.report(run)["steps"]
+                if step["name"].startswith("source_revision_observation_")
+            ]
+        )
+        == 2
+    )
+    assert len(smoke_calls) == strategy.starts == 1
+
+
+def test_source_revision_exception_still_blocks_changed_repository_data(
+    endpoint_migration, monkeypatch
+):
+    migrator, _, target, _, live = endpoint_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    live["source"]["revision"] = "c" * 40
+    monkeypatch.setattr(
+        orchestrator,
+        "snapshot_repository",
+        lambda *args: {
+            "refs": {"refs/heads/main": "f" * 40},
+            "default_branch": "main",
+            "lfs_oids": [],
+        },
+    )
+    assert migrator.verify(allow_source_revision_drift=True)["status"] == "blocked"
+    assert (
+        "Source repository changed"
+        in migrator.store.step(migrator.run_id, "team/repo", "verification")["data"]["error"]
+    )
+    assert migrator.activate(allow_source_revision_drift=True)["status"] == "blocked"
+    assert target.builds_access_level == "disabled"
 
 
 @pytest.mark.parametrize(

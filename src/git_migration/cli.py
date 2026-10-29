@@ -222,6 +222,22 @@ def verify_command(
         False,
         help="Confirm IT excluded policy-injected jobs and other pipeline triggers during the smoke test",
     ),
+    refresh_endpoints: bool = typer.Option(
+        False,
+        help="Record changed GitLab versions/revisions for a completed Git-copy run and require fresh verification",
+    ),
+    allow_source_revision_drift: bool = typer.Option(
+        False,
+        help="Git copy only: audit source build-revision drift while pinning versions and destination identity",
+    ),
+    source_frozen: bool = typer.Option(
+        False,
+        help="Confirm the source freeze when accepting endpoint changes",
+    ),
+    destination_isolated: bool = typer.Option(
+        False,
+        help="Confirm destination job isolation when accepting endpoint changes",
+    ),
     pilot_workload: Annotated[
         list[str] | None,
         typer.Option(
@@ -230,6 +246,13 @@ def verify_command(
     ] = None,
 ) -> None:
     """Verify data and reviewed MRs. --run-smoke temporarily enables isolated smoke CI."""
+    if (refresh_endpoints or allow_source_revision_drift) and (
+        not source_frozen or not destination_isolated
+    ):
+        typer.echo(
+            "Endpoint exceptions require --source-frozen and --destination-isolated.", err=True
+        )
+        raise typer.Exit(2)
     if run_smoke and not smoke_isolated:
         typer.echo(
             "--run-smoke requires --smoke-isolated: IT must exclude policy-injected jobs and other pipeline triggers.",
@@ -253,7 +276,21 @@ def verify_command(
                 )
             workloads[path] = int(identifier)
         migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
-        _finish(migrator.verify(run_smoke, workloads) if workloads else migrator.verify(run_smoke))
+        if allow_source_revision_drift:
+            _finish(
+                migrator.verify(
+                    run_smoke,
+                    workloads or None,
+                    refresh_endpoints=refresh_endpoints,
+                    allow_source_revision_drift=True,
+                )
+            )
+        elif refresh_endpoints:
+            _finish(migrator.verify(run_smoke, workloads or None, refresh_endpoints=True))
+        else:
+            _finish(
+                migrator.verify(run_smoke, workloads) if workloads else migrator.verify(run_smoke)
+            )
 
     _guard(action)
 
@@ -272,6 +309,10 @@ def activate_command(
         False,
         help="Allow quarantined Git-copy CI API access before activation; attest IT excluded external triggers and policy-injected jobs",
     ),
+    allow_source_revision_drift: bool = typer.Option(
+        False,
+        help="Git copy only: audit source build-revision drift while pinning versions and destination identity",
+    ),
 ) -> None:
     """Reverify and enable destination CI; source projects remain untouched."""
     if not source_frozen:
@@ -280,10 +321,11 @@ def activate_command(
 
     def action() -> None:
         store = StateStore(ctx.obj)
+        migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
         _finish(
-            Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated).activate(
-                enable_schedules
-            )
+            migrator.activate(enable_schedules, allow_source_revision_drift=True)
+            if allow_source_revision_drift
+            else migrator.activate(enable_schedules)
         )
 
     _guard(action)

@@ -21,6 +21,13 @@ def show_report(report: dict[str, Any]) -> None:
     for step in report.get("steps", []):
         typer.echo(f"  {step['resource']} / {step['name']}: {step['status']}")
         data = step.get("data", {})
+        if data.get("source_revision_drift_accepted"):
+            before = data["planned_endpoint_snapshot"]["source"]
+            after = data["observed_endpoint_snapshot"]["source"]
+            typer.echo(
+                f"    Accepted source build revision: {before['revision']} -> {after['revision']}; "
+                "source version and destination identity unchanged"
+            )
         merge_requests = data.get("merge_requests", {})
         if "omitted_count" in merge_requests:
             typer.echo(

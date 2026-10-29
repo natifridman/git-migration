@@ -87,6 +87,108 @@ def test_endpoint_drift_requires_replanning():
         verify_endpoints(plan, source, target)
 
 
+def test_git_copy_drift_diagnostic_identifies_changed_fields_and_existing_run_recovery():
+    source, target = providers()
+    c = config()
+    c.repositories[0].strategy = "git_copy"
+    plan = build_plan(c, source, target)
+    source.version = lambda: {"version": plan.source_version, "revision": "c" * 40}
+    target.version = lambda: {"version": "18.5.2", "revision": "b" * 40}
+    with pytest.raises(CompatibilityBlocked) as error:
+        verify_endpoints(plan, source, target)
+    message = str(error.value)
+    assert f"source revision: {'a' * 40} -> {'c' * 40}" in message
+    assert f"destination version: {plan.destination_version} -> 18.5.2" in message
+    assert "--refresh-endpoints" in message
+    assert "same run" in message
+    assert "pilot" not in message
+
+
+def test_endpoint_diagnostic_never_echoes_unrecognized_saved_values():
+    source, target = providers()
+    plan = build_plan(config(), source, target)
+    plan.endpoint_snapshot["source"]["version"] = "synthetic-sensitive-marker"
+    plan.endpoint_snapshot["source"]["revision"] = "synthetic-sensitive-marker"
+    plan.endpoint_snapshot["source"]["url"] = "https://synthetic-sensitive-marker.example"
+    with pytest.raises(CompatibilityBlocked) as error:
+        verify_endpoints(plan, source, target)
+    assert "synthetic-sensitive-marker" not in str(error.value)
+    assert "unavailable" in str(error.value)
+    assert "--refresh-endpoints" not in str(error.value)
+
+
+def test_source_revision_drift_is_explicit_and_does_not_repin_the_plan():
+    source, target = providers()
+    c = config()
+    c.repositories[0].strategy = "git_copy"
+    plan = build_plan(c, source, target)
+    original = plan.model_dump()
+    source.version = lambda: {"version": plan.source_version, "revision": "c" * 40}
+    with pytest.raises(CompatibilityBlocked, match="--allow-source-revision-drift"):
+        verify_endpoints(plan, source, target)
+    observed = verify_endpoints(plan, source, target, allow_source_revision_drift=True)
+    assert observed["source"]["revision"] == "c" * 40
+    assert observed["destination"] == plan.endpoint_snapshot["destination"]
+    assert plan.model_dump() == original
+    # The runtime opt-in must be repeated; no allowance is persisted into the plan.
+    with pytest.raises(CompatibilityBlocked):
+        verify_endpoints(plan, source, target)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "native",
+        "mixed",
+        "pilot",
+        "source_version",
+        "destination_version",
+        "destination_revision",
+        "source_url",
+        "destination_url",
+        "missing_source_revision",
+        "invalid_source_revision",
+        "unknown_saved_source_revision",
+        "unknown_destination_revision",
+    ],
+)
+def test_source_revision_exception_refuses_other_drift_and_unknown_identity(fault):
+    source, target = providers()
+    c = config()
+    c.repositories[0].strategy = "git_copy"
+    plan = build_plan(c, source, target)
+    source_metadata = {"version": plan.source_version, "revision": "c" * 40}
+    target_metadata = {"version": plan.destination_version, "revision": "b" * 40}
+    source.version, target.version = lambda: source_metadata, lambda: target_metadata
+    if fault == "native":
+        plan.config.repositories[0].strategy = "direct_transfer"
+    elif fault == "mixed":
+        plan.config.repositories.append(
+            plan.config.repositories[0].model_copy(update={"strategy": "direct_transfer"})
+        )
+    elif fault == "pilot":
+        plan.pilot = True
+    elif fault == "source_version":
+        source_metadata["version"] = "19.1.1"
+    elif fault == "destination_version":
+        target_metadata["version"] = "19.1.1"
+    elif fault == "destination_revision":
+        target_metadata["revision"] = "d" * 40
+    elif fault in {"source_url", "destination_url"}:
+        plan.endpoint_snapshot[fault.split("_")[0]]["url"] = "https://changed.example"
+    elif fault == "missing_source_revision":
+        source_metadata["revision"] = ""
+    elif fault == "invalid_source_revision":
+        source_metadata["revision"] = "synthetic-sensitive-marker"
+    elif fault == "unknown_saved_source_revision":
+        plan.endpoint_snapshot["source"]["revision"] = ""
+    elif fault == "unknown_destination_revision":
+        plan.endpoint_snapshot["destination"]["revision"] = target_metadata["revision"] = ""
+    with pytest.raises(CompatibilityBlocked) as error:
+        verify_endpoints(plan, source, target, allow_source_revision_drift=True)
+    assert "synthetic-sensitive-marker" not in str(error.value)
+
+
 def test_project_explicit_uses_project_access_not_ancestor_owner(monkeypatch):
     source, target = providers()
     source.roles[1] = 10

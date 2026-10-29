@@ -47,6 +47,26 @@ The verifier checks branch/tag object IDs, default branch, LFS IDs, merge reques
 
 ## CI, variables, and optional settings
 
+Saved endpoint versions/revisions remain pinned by default for every strategy.
+After a completed Git-copy import and CI preparation, the explicit
+`verify --refresh-endpoints --source-frozen --destination-isolated` option can
+record a server deployment at the same URLs and require fresh verification and
+smoke evidence. It preserves import/MR identities and prior evidence. It does not
+support native or mixed-strategy runs, pilots, incomplete imports/preparation,
+changed URLs, unknown revisions, or runs with activation attempts. See the
+[refresh procedure](git-copy.md#gitlab-changed-after-the-copy). Passing the renewed
+checks proves only their documented coverage; it is not native-import compatibility
+evidence or an application workload test.
+
+For non-pilot Git-copy runs, `--allow-source-revision-drift` on `verify` or
+`activate` is a narrower runtime exception for changing source build revisions
+under the same exact source version, URLs, and destination version/revision.
+It audits each accepted observation, keeps successful destination smoke evidence,
+and still verifies frozen repository data and CI configuration. It does not
+accept source version changes, destination deployment changes, unknown revisions,
+or native/mixed-strategy drift. The operator must repeat the opt-in each command;
+source freeze and the applicable isolation/review/activation gates still apply.
+
 With the default `variables.mode: preserve_scopes`, CI/CD variables are fetched again from their original source scopes during execution and reconciled at the mapped group or project scope. A project cannot flatten an ancestor group's variables without changing precedence. Opt-in `project_explicit` uses the complete declared project-variable list and leaves group variables untouched, as described above. Existing conflicting destination variables block rather than being silently replaced. Unreadable values require operator-provided environment references; variable metadata that the destination cannot preserve must be reconciled before cutover. Imported secret values can still be dangerous if destination runners are available before isolation.
 
 CI edits are conservative and reviewable. Runtime tag expressions, unsupported/dynamic includes, cross-instance includes, unresolved inheritance, external dependency mappings, and complex YAML may require a manual migration MR. For projects with CI jobs, source pipeline statuses are historical and cannot replace an approved destination runner smoke job. Running that job requires `--run-smoke --smoke-isolated`: IT must prevent other triggers and policy-injected jobs before temporary CI enablement. Protected-only runner fleets block because automatic protection of smoke branches is unsupported.
