@@ -1,6 +1,6 @@
 # GitLab migration
 
-A manifest-driven Python CLI for migrating projects between GitLab instances with repository history, CI/CD variables, and reviewable runner changes. Each project explicitly selects native direct transfer, file export/import, or a Git copy for repositories without issues or merge requests. Native strategies preserve supported GitLab metadata. Execution records durable state and produces a report so interrupted work can be resumed without blindly repeating an import.
+A manifest-driven Python CLI for migrating projects between GitLab instances with repository history, CI/CD variables, and reviewable runner changes. Each project explicitly selects native direct transfer, file export/import, or a Git copy. Git copy refuses issues and, by default, merge requests; omitting MR history requires an explicit per-project opt-in. Native strategies preserve supported GitLab metadata. Execution records durable state and produces a report so interrupted work can be resumed without blindly repeating an import.
 
 Choose a strategy for each project:
 
@@ -8,7 +8,7 @@ Choose a strategy for each project:
 | --- | --- |
 | `direct_transfer` (default) | You need supported GitLab metadata and can meet the native direct-transfer compatibility and access requirements. |
 | `file_export` | You explicitly choose native export/import after reviewing its compatibility, membership, and attribution limits. |
-| `git_copy` | You need Git history, branches/tags, LFS, variables, and runner configuration for a source with no issues or merge requests. Native project metadata is not copied. |
+| `git_copy` | You need Git history, branches/tags, LFS, variables, and runner configuration for a source with no issues. MRs block unless you explicitly opt to omit their history. Native project metadata is not copied. |
 
 Review the [strategy requirements](docs/limitations.md#strategy-selection) before
 planning. The focused [`git_copy` workflow](docs/git-copy.md) does not use the
@@ -67,6 +67,7 @@ Open `migration.yaml` in your editor and update these fields before running any 
 | `group_mapping` | Source group paths mapped to destination group paths. Preserve subgroup structure. In the default `preserve_scopes` variable mode, include every ancestor that supplies inherited variables. |
 | `repositories` | One entry per project, with `source_path` and `destination_path` such as `engineering/platform/sample-service` and `migrated-engineering/platform/sample-service`. Use namespace/project paths without a hostname. The destination namespace must follow `group_mapping`. |
 | `repositories[].strategy` | `direct_transfer` (the default), `file_export`, or `git_copy`. Review the [selection and compatibility requirements](docs/limitations.md#strategy-selection). |
+| `repositories[].skip_merge_request_history` | Defaults to false. With `git_copy` only, explicitly omit source MR history, discussions, approvals and MR-only refs. Issues still block. Generate a fresh plan after opting in. |
 | `repositories[].ci_branches` | Use `[]` for the default branch, or list the actual CI branches to edit. Replace the example's `main` if needed. |
 | `variables.mode` | Keep the default `preserve_scopes` to reconcile source project and mapped group variables at their original scopes. Choose `project_explicit` to declare project variables and leave group variables untouched. |
 | `repositories[].variable_overrides` | In `preserve_scopes` mode, use `{}` if no overrides are needed. Otherwise map a variable key, optionally followed by `@environment_scope`, to `env:NAME` and supply that environment variable in step 3. Remove the example overrides unless you need them. |

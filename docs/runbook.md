@@ -34,6 +34,13 @@ Match the complete job tag set and protected-ref requirements. Tag discovery sel
 Run `plan MANIFEST --output plan.json` against the actual source and destination. Check every finding, version/capability result, group mapping, selected strategy, source identity, and target path. There is no silent fallback from direct transfer to file import. Review the file-import membership acceptance gate and identity limits before enabling that strategy. Keep destination groups precreated unless explicit creation under the mapped hierarchy is intended.
 
 A blocked plan is still saved for inspection and the command exits with status 2.
+For `git_copy_metadata`, use a native strategy to preserve issues and MRs. If only
+MR history may be omitted, explicitly set the repository's
+`skip_merge_request_history: true` with `strategy: git_copy`, review the
+[omission scope](git-copy.md#intentionally-omit-merge-request-history), and generate
+a fresh plan. Issues still block, and all freeze, isolation, CI review,
+verification, and activation gates remain required.
+
 `0 repositories` means no repository completed project inventory; it does not
 necessarily mean the manifest selected none. An `inventory_failed` finding names
 the failed source/destination operation and includes the provider's sanitized HTTP
@@ -63,7 +70,22 @@ Run `apply PLAN --source-frozen --destination-isolated`, retain its run ID, and 
 
 Preparation retains disabled destination CI while reconciling variables under the selected policy, runner configuration, and CI edits on migration branches with draft merge requests. Review supported edits to explicit runner tags and project includes. Dynamic includes, unresolved references, external forks, submodules, ambiguous inherited configuration, or unsupported syntax require manual review; do not approve activation while related blockers remain.
 
+If a Git-copy destination returns HTTP 403 from CI APIs because the CI feature is
+disabled, use the explicit [quarantined CI API workflow](git-copy.md#ci-api-access-while-the-project-is-quarantined).
+`--ci-api-isolated` requires IT to exclude other operators, external triggers, and
+policy-injected jobs throughout the command. Its temporary CI-feature access uses
+a journaled configuration that rejects pipelines, and restores disabled CI before
+restoring the original configuration. It does not waive inventories, smoke tests,
+review, or activation. Resume the existing run rather than recreating the target.
+
 ## 4. Verify before activation
+
+If a Git-copy run has a job-tag mismatch and `runner_mrs` contains only unchanged
+configuration, use the [saved-run tag correction](git-copy.md#correct-a-missing-tag-mapping-after-git-copy)
+after confirming the intended runner fleet. `resume --runner-tag-map OLD=NEW` is
+limited to one repository before any CI MR, smoke or activation attempt. It
+audits the revision and prepares a review MR while preserving the completed
+import. Changing `runners.tags` alone does not change job tags.
 
 Review and merge each generated migration MR. Migration commits intentionally change branch object IDs, so use the verifier's recorded migration-MR evidence when assessing expected differences. Do not discard unexplained ref differences. Verification compares repository branches/tags/default branch and LFS object identities, MR state/metadata and discussion contents, scoped variable reconciliation, runner eligibility, and required preparation evidence. Imported historical pipeline success is not evidence that destination CI works.
 

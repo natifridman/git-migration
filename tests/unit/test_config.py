@@ -62,6 +62,7 @@ def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None
     original.pop("variables")
     for repo in original["repositories"]:
         repo.pop("ci_variables")
+        repo.pop("skip_merge_request_history")
     old_hash = hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest()
     path = tmp_path / "plan.json"
     path.write_text(
@@ -76,6 +77,42 @@ def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None
         )
     )
     assert load_plan(path).config_hash == old_hash
+
+
+@pytest.mark.parametrize("strategy", ["direct_transfer", "file_export"])
+def test_skipping_mr_history_requires_git_copy(strategy: str) -> None:
+    data = manifest()
+    data["repositories"][0].update(strategy=strategy, skip_merge_request_history=True)
+    with pytest.raises(ValidationError, match="skip_merge_request_history requires git_copy"):
+        MigrationConfig.model_validate(data)
+
+
+def test_git_copy_history_policy_is_fingerprinted_and_old_plans_default_to_strict(
+    tmp_path: Path,
+) -> None:
+    data = manifest()
+    data["repositories"][0]["strategy"] = "git_copy"
+    config = MigrationConfig.model_validate(data)
+    original_hash = config.fingerprint()
+    data["repositories"][0]["skip_merge_request_history"] = False
+    assert MigrationConfig.model_validate(data).fingerprint() == original_hash
+    plan = MigrationPlan(
+        created_at="2026-10-29T00:00:00Z",
+        config=config,
+        config_hash=original_hash,
+        source_version="19.6.0-pre",
+        destination_version="19.4.3-ee",
+    ).model_dump(mode="json")
+    plan["config"]["repositories"][0].pop("skip_merge_request_history")
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    assert not load_plan(path).config.repositories[0].skip_merge_request_history
+    plan["config"]["repositories"][0]["skip_merge_request_history"] = True
+    path.write_text(json.dumps(plan))
+    with pytest.raises(ValueError, match="configuration changed"):
+        load_plan(path)
+    config.repositories[0].skip_merge_request_history = True
+    assert config.fingerprint() != original_hash
 
 
 @pytest.mark.parametrize(

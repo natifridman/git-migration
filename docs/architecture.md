@@ -33,8 +33,10 @@ hosting does not add GitHub migration endpoints or convert migrated pipelines.
 Native transfer preserves GitLab entities that a manual repository creation plus Git push cannot reproduce faithfully. Direct transfer is the default explicit strategy; file export/import is a separately selected path with different membership and attribution behavior. The application never silently changes strategy. Native import handles code and supported metadata; API steps fill gaps such as variables, runner access, and optional settings. Consult the installed release's [migration entity coverage](https://docs.gitlab.com/user/group/import/migrated_items/) and [project export/import documentation](https://docs.gitlab.com/user/project/settings/import_export/) during the pilot.
 
 The explicit `git_copy` strategy instead creates a private, CI-disabled project
-and transfers branches/tags and LFS through Git. It refuses sources with issues or
-merge requests, uses the existing variable/runner/verification steps, and does not
+and transfers branches/tags and LFS through Git. It refuses sources with issues;
+merge requests also block unless the repository explicitly selects
+`skip_merge_request_history`. That option records an omission rather than MR
+preservation evidence. It uses the existing variable/runner/verification steps and does not
 use native-import compatibility or fixture gates. Its creation journal pins the
 target project ID; uncertain creation cannot be recovered by adopting a path.
 
@@ -44,6 +46,34 @@ target project ID; uncertain creation cannot be recovered by adopting a path.
 New plans record their pilot designation and destination inherited-variable
 metadata. Default-valued policy additions are omitted from configuration
 fingerprints so existing saved plans still load with their original hashes.
+The default `skip_merge_request_history: false` is likewise omitted from the
+fingerprint; true is included. No plan/checkpoint schema version change is needed.
+Existing Git-copy journals without the field mean false; opted-in journals record
+true, and resume refuses a policy mismatch.
+
+`resume --runner-tag-map` permits a scoped configuration revision only for a
+single non-pilot Git-copy run after baseline verification and unchanged runner
+preparation, before CI edits/MRs, smoke, or activation. Under the workspace lock,
+one SQLite transaction records the previous/new tag maps and configuration
+hashes, retains superseded preparation/verification evidence in a revision
+checkpoint, and saves a newly fingerprinted run plan. Import identities and
+snapshots remain untouched. The saved plan JSON file is not rewritten. This is
+an explicit revision of the run's configuration, not a relaxation of hash checks;
+no schema change or automatic conversion of existing runs is required. Commands
+that loaded a prior configuration hash stop after acquiring the lock. Repeating
+the identical correction resumes the same deterministic MR preparation without
+revising evidence again. A different correction is refused while preparation is
+incomplete, including an ambiguous remote write.
+
+`--ci-api-isolated` is a per-command runtime attestation, so it does not change the
+saved-plan fingerprint or schema. On destination CI-API HTTP 403, eligible
+Git-copy commands can use a journaled, pipeline-denying CI configuration for
+temporary feature access. Ownership records validate the retained guard branch;
+settings recovery disables CI before restoring its original path and runs before
+other work. The `ci_api_access` checkpoint reports successful cleanup, not a
+permission or verification bypass. Smoke probes still require their own explicit
+isolation flags and persist each job's pipeline, commit and branch identities for
+later verification.
 The defaults are strict compatibility, scope preservation, and exclusive runner
 access; experimental direct transfer, explicit project variables, and per-job
 eligibility are opt-in policies. Pilot activation is prohibited. Production

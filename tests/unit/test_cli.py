@@ -57,6 +57,11 @@ def test_help_and_version_do_not_require_credentials() -> None:
         ("apply", ["--source-frozen"], "--source-frozen and --destination-isolated"),
         ("resume", [], "--source-frozen and --destination-isolated"),
         ("resume", ["--destination-isolated"], "--source-frozen and --destination-isolated"),
+        (
+            "resume",
+            ["--runner-tag-map", "old=approved"],
+            "--source-frozen and --destination-isolated",
+        ),
         ("activate", [], "--source-frozen"),
     ],
 )
@@ -93,7 +98,9 @@ def test_apply_rebuilds_authoritative_plan_and_does_not_trust_ids(
     monkeypatch.setattr(cli, "build_plan", rebuild)
 
     class Migrator:
-        def __init__(self, plan: MigrationPlan, store: StateStore, run: str, *args: Any) -> None:
+        def __init__(
+            self, plan: MigrationPlan, store: StateStore, run: str, *args: Any, **kwargs: Any
+        ) -> None:
             assert plan.repositories[0].source_id == 10
             assert plan.groups == {}
             self.store, self.run = store, run
@@ -306,8 +313,9 @@ def test_malformed_yaml_is_sanitized(tmp_path: Path) -> None:
     assert "Traceback" not in result.output
 
 
+@pytest.mark.parametrize("extra", [[], ["--ci-api-isolated"]])
 def test_smoke_requires_policy_and_trigger_isolation_attestation_before_providers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
 ) -> None:
     monkeypatch.setattr(
         cli,
@@ -315,8 +323,115 @@ def test_smoke_requires_policy_and_trigger_isolation_attestation_before_provider
         lambda *args: pytest.fail("Missing smoke attestation must not resolve providers"),
     )
     result = runner.invoke(
-        cli.app, ["--state-dir", str(tmp_path / "state"), "verify", "synthetic-run", "--run-smoke"]
+        cli.app,
+        ["--state-dir", str(tmp_path / "state"), "verify", "synthetic-run", "--run-smoke", *extra],
     )
     assert result.exit_code == 2
     assert "--smoke-isolated" in result.output
     assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("command", ["apply", "resume", "verify", "activate"])
+def test_ci_api_isolation_is_passed_per_command(tmp_path, monkeypatch, command):
+    plan = make_plan()
+    store = StateStore(tmp_path / "state")
+    run = store.create_run(plan)
+    path = tmp_path / "plan.json"
+    path.write_text(plan.model_dump_json())
+    monkeypatch.setattr(cli, "clients_for", lambda *args: (None, None))
+    monkeypatch.setattr(cli, "build_plan", lambda *args, **kwargs: plan)
+    received = []
+
+    def selected(*args, **kwargs):
+        received.append(kwargs["ci_api_isolated"])
+        raise RuntimeError("Stop before execution")
+
+    monkeypatch.setattr(cli, "Migrator", selected)
+    flags = [] if command == "verify" else ["--source-frozen"]
+    if command in {"apply", "resume"}:
+        flags.append("--destination-isolated")
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(store.root),
+            command,
+            str(path) if command == "apply" else run,
+            *flags,
+            "--ci-api-isolated",
+        ],
+    )
+    assert result.exit_code == 2
+    assert received == [True]
+
+
+def test_resume_passes_explicit_tag_corrections(tmp_path, monkeypatch):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["ci_api_isolated"] is True
+
+        def prepare(self, changes):
+            received.append(changes)
+            return {"id": run, "status": "awaiting_verification"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "resume",
+            run,
+            "--source-frozen",
+            "--destination-isolated",
+            "--ci-api-isolated",
+            "--runner-tag-map",
+            "old=approved,linux",
+            "--runner-tag-map",
+            "legacy=approved",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == [{"old": ["approved", "linux"], "legacy": ["approved"]}]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["missing-equals"],
+        ["old="],
+        ["=new"],
+        ["old=$DYNAMIC"],
+        ["old=new,new"],
+        ["old=new", "old=other"],
+        ["old=new value"],
+        ["old=new=other"],
+    ],
+)
+def test_invalid_tag_correction_stops_before_state_or_provider_access(
+    tmp_path, monkeypatch, entries
+):
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Invalid tags must stop first")
+    )
+    flags = [item for entry in entries for item in ("--runner-tag-map", entry)]
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "resume",
+            "synthetic-run",
+            "--source-frozen",
+            "--destination-isolated",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "OLD=NEW[,NEW]" in result.output
+    assert not state.exists()

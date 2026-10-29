@@ -14,6 +14,26 @@ from pathlib import Path
 from typing import Any
 
 from git_migration.models import MigrationPlan
+from git_migration.secrets import SafeError
+
+
+class RunnerTagRevisionBlocked(SafeError):
+    pass
+
+
+def validate_runner_tag_changes(changes: dict[str, list[str]]) -> None:
+    if not changes or any(
+        not targets
+        or len(targets) != len(set(targets))
+        or any(
+            not tag or any(char.isspace() or char in "$=," for char in tag)
+            for tag in [old, *targets]
+        )
+        for old, targets in changes.items()
+    ):
+        raise RunnerTagRevisionBlocked(
+            "Use literal runner tag mappings OLD=NEW[,NEW] with nonempty, unique target tags"
+        )
 
 
 def utc_now() -> str:
@@ -97,6 +117,112 @@ class StateStore:
     def set_status(self, run_id: str, status: str) -> None:
         with self.connection() as db:
             db.execute("UPDATE runs SET status=? WHERE id=?", (status, run_id))
+
+    def revise_runner_tags(
+        self, run_id: str, changes: dict[str, list[str]], expected_config_hash: str
+    ) -> MigrationPlan:
+        """Caller holds the workspace lock; atomically audit a narrow pre-MR correction."""
+        validate_runner_tag_changes(changes)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise RunnerTagRevisionBlocked("Unknown migration run")
+            plan = MigrationPlan.model_validate_json(run["plan"])
+            if (
+                plan.config_hash != expected_config_hash
+                or plan.config_hash != plan.config.fingerprint()
+            ):
+                raise RunnerTagRevisionBlocked(
+                    "Saved configuration changed; reload the run before retrying"
+                )
+            if (
+                run["status"] == "active"
+                or plan.pilot
+                or len(plan.config.repositories) != 1
+                or plan.config.repositories[0].strategy != "git_copy"
+            ):
+                raise RunnerTagRevisionBlocked(
+                    "Runner tag corrections require one inactive, non-pilot Git-copy repository"
+                )
+            previous_map = plan.config.runners.tag_map
+            revised_map = {**previous_map, **changes}
+            if revised_map == previous_map:
+                # Retrying the same correction must recover the original MR, even after a crash.
+                return plan
+            resource = plan.config.repositories[0].source_path
+            rows = db.execute(
+                "SELECT * FROM steps WHERE run_id=? AND resource=?", (run_id, resource)
+            ).fetchall()
+            steps = {row["name"]: {**dict(row), "data": json.loads(row["data"])} for row in rows}
+            if any(
+                steps.get(name, {}).get("status") != "complete"
+                for name in ("snapshot", "import", "baseline_verified", "runner_mrs")
+            ):
+                raise RunnerTagRevisionBlocked(
+                    "Runner tag corrections require completed import, baseline and unchanged CI preparation"
+                )
+            requests = steps["runner_mrs"]["data"].get("requests", [])
+            if (
+                not requests
+                or any(
+                    item.get("status") != "unchanged"
+                    or item.get("iid")
+                    or item.get("changed")
+                    or item.get("blockers")
+                    for item in requests
+                )
+                or "smoke" in steps
+                or "activation" in steps
+            ):
+                raise RunnerTagRevisionBlocked(
+                    "Runner tag corrections are allowed only before CI MR, smoke or activation attempts; retain existing evidence"
+                )
+            known_tags = {
+                tag for item in requests for job in item.get("jobs", []) for tag in job["tags"]
+            }
+            if set(changes) - known_tags:
+                raise RunnerTagRevisionBlocked(
+                    "Each corrected source tag must appear in the saved CI job inventory"
+                )
+            previous_hash = plan.config_hash
+            plan.config.runners.tag_map = revised_map
+            plan.config_hash = plan.config.fingerprint()
+            superseded = {
+                name: steps[name]
+                for name in ("runner_mrs", "preparation", "verification")
+                if name in steps
+            }
+            audit = {
+                "previous_config_hash": previous_hash,
+                "config_hash": plan.config_hash,
+                "previous_tag_map": previous_map,
+                "tag_map": revised_map,
+                "superseded_steps": superseded,
+            }
+            revision = 1 + sum(name.startswith("runner_tag_revision_") for name in steps)
+            now = utc_now()
+            db.execute(
+                "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    resource,
+                    f"runner_tag_revision_{revision}",
+                    "complete",
+                    json.dumps(audit),
+                    now,
+                ),
+            )
+            for name in superseded:
+                db.execute(
+                    "UPDATE steps SET status='superseded',updated_at=? WHERE run_id=? AND resource=? AND name=?",
+                    (now, run_id, resource, name),
+                )
+            db.execute(
+                "UPDATE runs SET plan=?,status='preparing' WHERE id=?",
+                (plan.model_dump_json(), run_id),
+            )
+            return plan
 
     def save(
         self, run_id: str, resource: str, name: str, status: str, data: dict[str, Any]

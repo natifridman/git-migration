@@ -80,7 +80,13 @@ def recover_smoke(destination: Provider, work_dir: Path) -> dict:
 
 
 def _prepare_branch(
-    destination: Provider, project: dict, branch: str, filename: str, content: str
+    destination: Provider,
+    project: dict,
+    branch: str,
+    filename: str,
+    content: str,
+    *,
+    commit_message: str = "Add isolated runner smoke configuration [skip ci]",
 ) -> str:
     prefix = f"/projects/{int(project['id'])}"
     branch_path = prefix + "/repository/branches/" + quote(branch, safe="")
@@ -102,7 +108,7 @@ def _prepare_branch(
             prefix + "/repository/commits",
             {
                 "branch": branch,
-                "commit_message": "Add isolated runner smoke configuration [skip ci]",
+                "commit_message": commit_message,
                 "actions": [{"action": "create", "file_path": filename, "content": content}],
             },
         )
@@ -117,7 +123,9 @@ def _prepare_branch(
     return str(current["commit"]["id"])
 
 
-def owned_smoke_refs(destination: Provider, project_id: int, work_dir: Path) -> dict:
+def owned_smoke_refs(
+    destination: Provider, project_id: int, work_dir: Path, *, record_prefix: str = "smoke"
+) -> dict:
     """Return only exact branches proven to contain our single inert CI-file commit.
 
     Ownership records survive both settings cleanup and process interruption. They
@@ -126,7 +134,7 @@ def owned_smoke_refs(destination: Provider, project_id: int, work_dir: Path) -> 
     refs: dict[str, str] = {}
     blockers: list[str] = []
     prefix = f"/projects/{int(project_id)}"
-    for path in sorted(Path(work_dir).glob(f"smoke-owned-{int(project_id)}-*.json")):
+    for path in sorted(Path(work_dir).glob(f"{record_prefix}-owned-{int(project_id)}-*.json")):
         try:
             record = json.loads(path.read_text())
             if record["destination_url"] != destination.url or int(record["project_id"]) != int(
@@ -191,6 +199,7 @@ def run_smoke(
     timeout: int = 300,
     required_tag_sets: list[list[str]] | None = None,
     protected: bool = False,
+    schedules_verified: bool = False,
 ) -> dict:
     """Probe each unique literal tag set; return evidence and retain the owned branch.
 
@@ -226,7 +235,16 @@ def run_smoke(
         blockers.append("Smoke probe requires a destination default branch.")
         return result
     prefix = f"/projects/{int(project['id'])}"
-    if any(item.get("active") for item in destination.list(prefix + "/pipeline_schedules")):
+    schedules: list[dict] | None
+    try:
+        schedules = destination.list(prefix + "/pipeline_schedules")
+    except ProviderError as error:
+        if error.status_code != 403 or not schedules_verified:
+            raise
+        # The caller just checked these under its separately attested API guard.
+        # Recheck after enabling the standalone smoke path, before any pipeline POST.
+        schedules = None
+    if schedules is not None and any(item.get("active") for item in schedules):
         blockers.append("Disable all destination pipeline schedules before the smoke probe.")
         return result
     tag_sets = sorted(
@@ -325,6 +343,8 @@ def run_smoke(
                 "Could not establish isolated smoke CI configuration while builds are disabled."
             )
         destination.put(prefix, {"builds_access_level": "enabled"})
+        if any(item.get("active") for item in destination.list(prefix + "/pipeline_schedules")):
+            raise SmokeBlocked("Destination schedules became active before the smoke probe.")
         # Reuse only a pipeline with the exact owned ref and commit; never retry a POST.
         pipelines = destination.list(prefix + "/pipelines", {"ref": branch, "source": "api"})
         matching = [
@@ -401,6 +421,9 @@ def run_smoke(
                     "name": job["name"],
                     "status": job["status"],
                     "runner_id": (job.get("runner") or {}).get("id"),
+                    "pipeline_id": pipeline_id,
+                    "commit_sha": commit_sha,
+                    "branch": branch,
                 }
             )
         if pipeline.get("status") != "success":

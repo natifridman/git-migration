@@ -25,11 +25,17 @@ policy for arbitrary future CI edits. Both alternatives must be explicitly chose
 | --- | --- | --- |
 | `direct_transfer` | Destination GitLab native bulk import of one project into an existing mapped group. Requires supported versions, enabled capabilities, network connectivity from destination to source, and suitable source/destination permissions. | Requests `migrate_memberships: false`; IT manages target access. Contributions use GitLab's native user mapping and placeholders where the installed releases support them. |
 | `file_export` | Source native asynchronous export, private local opaque archive, destination native project import. Explicit opt-in only; never a silent fallback. | Requires `accept_file_import_memberships: true` because the local archive import API has no equivalent membership-disable switch. Native file-import attribution differs from direct transfer and may assign contributions to the importer when user matching is unavailable. |
-| `git_copy` | Explicit Git fetch and atomic push of branches/tags plus LFS, followed by variable and runner preparation. No native importer, version-window gate, or compatibility fixture. Refuses sources with issues or merge requests. See [the focused workflow](git-copy.md). | Commit objects and their authors remain unchanged. Project memberships and native project metadata are not copied. |
+| `git_copy` | Explicit Git fetch and atomic push of branches/tags plus LFS, followed by variable and runner preparation. No native importer, version-window gate, or compatibility fixture. Refuses sources with issues; MRs also block unless `skip_merge_request_history: true` is explicitly selected per repository. See [the focused workflow](git-copy.md). | Reachable commit objects and their authors remain unchanged. MR-only refs, project memberships and native project metadata are not copied. |
 
 The preflight policy is deliberately conservative: file imports require compatible editions/releases, with a destination at the same version or up to two minor releases newer including an adjacent major boundary when it falls within that window. This implementation applies the same conservative version window to direct transfer, additionally requiring destination GitLab 18.4+ and native capability checks. An older destination, unsupported version gap, known disabled API, or failed inventory/permissions check blocks the selected strategy. If application settings are hidden from a non-admin token, preflight warns and IT must confirm the capability; import remains subject to the server's enforcement. Review the exact installed patch releases and tier as part of the pilot. GitLab documents the file format compatibility window in [file export/import](https://docs.gitlab.com/user/project/settings/import_export/) and direct transfer requirements in [direct transfer prerequisites](https://docs.gitlab.com/user/group/import/direct_transfer_migrations/).
 
 All strategies refuse an occupied destination project. Only explicitly mapped missing groups can be created when enabled. There is no overwrite option, automatic target deletion, or automatic Git push fallback that discards native metadata. The native version window above applies to `direct_transfer` and `file_export`; `git_copy` uses the Git protocol and ordinary project APIs instead.
+
+`skip_merge_request_history` accepts omitting every source MR, including its
+discussions, approvals, and metadata. It does not preserve unmerged commits
+reachable only from MR refs. The option is limited to `git_copy`, defaults to
+false, and does not waive issue-history, API inventory, Git/LFS, CI review, runner,
+or activation checks. Reports label the MR history `omitted`, not verified.
 
 ## Contribution mapping is a separate acceptance item
 
@@ -45,7 +51,27 @@ With the default `variables.mode: preserve_scopes`, CI/CD variables are fetched 
 
 CI edits are conservative and reviewable. Runtime tag expressions, unsupported/dynamic includes, cross-instance includes, unresolved inheritance, external dependency mappings, and complex YAML may require a manual migration MR. For projects with CI jobs, source pipeline statuses are historical and cannot replace an approved destination runner smoke job. Running that job requires `--run-smoke --smoke-isolated`: IT must prevent other triggers and policy-injected jobs before temporary CI enablement. Protected-only runner fleets block because automatic protection of smoke branches is unsupported.
 
+The explicit `resume --runner-tag-map OLD=NEW` correction is limited to one
+non-pilot Git-copy repository with completed import/baseline and unchanged CI
+preparation, before any CI MR, smoke, or activation attempt. It cannot discard
+existing or ambiguous remote changes, change runner selection, or bypass review.
+It audits a newly fingerprinted saved-run configuration and retains superseded
+evidence. The original manifest/plan files remain unchanged; see the
+[correction procedure](git-copy.md#correct-a-missing-tag-mapping-after-git-copy).
+
 A project verified to have no `.gitlab-ci.yml`, no custom CI path, and explicitly disabled Auto DevOps is recorded as `no_ci`. It needs no runner MR or smoke job, and activation keeps CI disabled. Missing custom configuration and inaccessible files remain errors.
+
+For Git-copy runs, `--ci-api-isolated` explicitly permits a journaled fallback for
+destination CI-API HTTP 403 while CI is disabled. It requires IT isolation from
+external triggers, other operators, and policy-injected jobs. The guard's CI
+workflow denies pipelines; the temporary feature enablement does not submit a
+job, and cleanup restores disabled CI before the original CI path. Variable
+reconciliation in this fallback uses `project_explicit`; native imports and
+scope-preserving variable reconciliation retain their existing behavior. The
+flag does not bypass token permissions or treat inaccessible inventories as empty.
+Optional environment/schedule restoration APIs retain their normal access checks;
+this fallback covers project variables, schedule inventory and smoke-job reads.
+See [the recovery and run sequence](git-copy.md#ci-api-access-while-the-project-is-quarantined).
 
 `features.schedules`, `features.environments`, and `features.pages` default to false. Their enabled behavior has limited scope:
 

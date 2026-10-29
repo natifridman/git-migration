@@ -251,11 +251,24 @@ def build_plan(
                     "Copy Git branches, tags and LFS, then reconcile variables and runner configuration; native project metadata is not imported and no compatibility pilot is required",
                     repo.source_path,
                 )
-                if counts["merge_requests"] or counts["issues"]:
+                if repo.skip_merge_request_history:
+                    finding(
+                        "warning",
+                        "git_copy_merge_requests_omitted",
+                        f"Skipping history for {counts['merge_requests']} source merge requests, "
+                        "including discussions, approvals and MR metadata. Only commits reachable "
+                        "from branches and tags are copied; MR-only refs are excluded",
+                        repo.source_path,
+                    )
+                if counts["issues"] or (
+                    counts["merge_requests"] and not repo.skip_merge_request_history
+                ):
                     finding(
                         "blocker",
                         "git_copy_metadata",
-                        "Source has issues or merge requests; choose a native transfer to preserve them",
+                        "Source has issues; choose a native transfer to preserve them"
+                        if repo.skip_merge_request_history
+                        else "Source has issues or merge requests; choose a native transfer to preserve them",
                         repo.source_path,
                     )
             if project.get("pages_access_level") != "disabled" and not config.features.pages:

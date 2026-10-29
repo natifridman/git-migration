@@ -14,11 +14,18 @@ def show_report(report: dict[str, Any]) -> None:
     for finding in report.get("findings", []):
         if finding.get("code") == "experimental_compatibility":
             typer.echo("  WARNING: " + finding["message"])
+        if finding.get("code") == "git_copy_merge_requests_omitted":
+            typer.echo(f"  WARNING [{finding['repository']}]: {finding['message']}")
     for blocker in report.get("pilot_readiness_blockers", []):
         typer.echo("  Production evidence: " + blocker)
     for step in report.get("steps", []):
         typer.echo(f"  {step['resource']} / {step['name']}: {step['status']}")
         data = step.get("data", {})
+        merge_requests = data.get("merge_requests", {})
+        if "omitted_count" in merge_requests:
+            typer.echo(
+                f"    MR history omitted: {merge_requests['omitted_count']} source merge requests"
+            )
         for blocker in data.get("blockers", []):
             typer.echo(f"    {blocker}")
         for failure in data.get("failures", []):
