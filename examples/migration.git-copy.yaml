@@ -10,6 +10,7 @@ compatibility:
   mode: strict
 variables:
   mode: project_explicit
+  # Source project-variable HTTP 403 is a warning; ci_variables must be complete.
   # Review destination_variable_inventory before accepting inherited inputs.
   accept_destination_inheritance: false
 group_mapping:

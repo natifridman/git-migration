@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import gitlab
 import pytest
 import requests
 from typer.testing import CliRunner
@@ -164,6 +165,53 @@ def test_plan_pilot_flag_is_saved_and_passed_to_preflight(
     result = runner.invoke(cli.app, ["plan", str(manifest), "--pilot", "--output", str(output)])
     assert result.exit_code == 0, result.output
     assert json.loads(output.read_text())["pilot"] is True
+
+
+def test_blocked_plan_displays_and_saves_safe_inventory_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = GitLabProvider("https://source.example", "synthetic-sensitive-marker")
+    destination = GitLabProvider("https://destination.example", "synthetic-sensitive-marker")
+
+    def source_get(path: str, **kwargs: Any) -> dict:
+        return {
+            "/version": {"version": "18.4.1"},
+            "/user": {"id": 5},
+            "/projects/team%2Frepo": {"id": 10},
+        }[path]
+
+    def destination_get(path: str, **kwargs: Any) -> dict:
+        if path == "/projects/new%2Frepo":
+            raise gitlab.exceptions.GitlabHttpError("synthetic-sensitive-marker", response_code=404)
+        return {
+            "/version": {"version": "18.4.1"},
+            "/user": {"id": 5},
+            "/application/settings": {"bulk_import_enabled": True},
+        }[path]
+
+    def source_list(path: str, **kwargs: Any) -> list:
+        if path == "/projects/10/variables":
+            raise gitlab.exceptions.GitlabHttpError("synthetic-sensitive-marker", response_code=403)
+        assert path in {"/projects/10/merge_requests", "/projects/10/issues"}
+        return []
+
+    monkeypatch.setattr(source._client, "http_get", source_get)
+    monkeypatch.setattr(destination._client, "http_get", destination_get)
+    monkeypatch.setattr(source._client, "http_list", source_list)
+    monkeypatch.setattr(cli, "clients_for", lambda _: (source, destination))
+    manifest, output = tmp_path / "manifest.yaml", tmp_path / "plan.json"
+    manifest.write_text(make_plan().config.model_dump_json())
+    result = runner.invoke(cli.app, ["plan", str(manifest), "--output", str(output)])
+    assert result.exit_code == 2
+    assert "Plan: 0 repositories, 0 mapped groups" in result.output
+    saved = json.loads(output.read_text())
+    failure = next(item for item in saved["findings"] if item["code"] == "inventory_failed")
+    assert failure["severity"] == "blocker"
+    assert "source project variables inventory" in failure["message"]
+    assert "API request on source.example failed: HTTP 403" in failure["message"]
+    assert failure["message"] in result.output
+    assert "synthetic-sensitive-marker" not in result.output + output.read_text()
+    assert output.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize("drift", ["endpoint", "variables"])

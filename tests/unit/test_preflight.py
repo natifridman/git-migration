@@ -257,6 +257,75 @@ def test_inaccessible_ancestor_and_failed_inventory_block_plan() -> None:
     assert "inventory_failed" in codes(failed)
 
 
+@pytest.mark.parametrize(
+    ("side", "method", "path", "operation"),
+    [
+        ("source", "project", "team/sub/repo", "source project lookup"),
+        ("destination", "project", "new/sub/repo", "destination project lookup"),
+        *[
+            ("source", "list", f"/projects/100/{endpoint}", f"source project {endpoint} inventory")
+            for endpoint in (
+                "merge_requests", "issues", "variables", "pipeline_schedules", "environments"
+            )
+        ],
+        ("source", "group", "team", "source group lookup (team)"),
+        ("source", "get", "/groups/1/members/all/5", "source group membership check (team)"),
+        ("source", "list", "/groups/1/variables", "source group variables inventory (team)"),
+        ("destination", "group", "new", "destination group lookup (new)"),
+        ("destination", "get", "/groups/11/members/all/5", "destination group membership check (new)"),
+        ("destination", "list", "/groups/11/projects", "destination group projects inventory (new)"),
+    ],
+)
+def test_failed_inventory_identifies_operation_and_safe_provider_reason(
+    monkeypatch: pytest.MonkeyPatch, side: str, method: str, path: str, operation: str
+) -> None:
+    source, target = FakeProvider(), FakeProvider(target=True)
+    source.variables[1] = [{"key": "SYNTHETIC_KEY", "value": "synthetic-sensitive-marker"}]
+    provider = source if side == "source" else target
+    original = getattr(provider, method)
+
+    def denied(request_path: str, *args: Any, **kwargs: Any) -> Any:
+        if request_path == path:
+            raise ProviderError(403, server=f"{side}.example", operation="API request")
+        return original(request_path, *args, **kwargs)
+
+    monkeypatch.setattr(provider, method, denied)
+    plan = build_plan(config(), source, target)
+    failure = next(item for item in plan.findings if item.code == "inventory_failed")
+    assert plan.blocked
+    assert failure.repository == "team/sub/repo"
+    assert failure.message == (
+        f"Inventory failed during {operation}: GitLab API request on {side}.example failed: HTTP 403."
+    )
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert source.writes == target.writes == []
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (ProviderError(server="source.example", reason="timeout"), "request timed out"),
+        (RuntimeError("synthetic-sensitive-marker"), "RuntimeError"),
+    ],
+)
+def test_inventory_diagnostics_preserve_connection_reason_and_hide_arbitrary_errors(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, message: str
+) -> None:
+    source, target = FakeProvider(), FakeProvider(target=True)
+
+    def fail(path: str) -> dict:
+        raise error
+
+    monkeypatch.setattr(source, "project", fail)
+    plan = build_plan(config(), source, target)
+    failure = next(item for item in plan.findings if item.code == "inventory_failed")
+    assert plan.blocked
+    assert "source project lookup" in failure.message
+    assert message in failure.message
+    assert "synthetic-sensitive-marker" not in plan.model_dump_json()
+    assert source.writes == target.writes == []
+
+
 def test_missing_destination_group_requires_explicit_creation() -> None:
     source, target = FakeProvider(), FakeProvider(target=True)
     target.groups = {}

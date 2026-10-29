@@ -13,6 +13,8 @@ from git_migration.compatibility import (
     version_number,
 )
 from git_migration.models import Finding, MigrationConfig, MigrationPlan, PlannedRepository
+from git_migration.providers import ProviderError
+from git_migration.secrets import safe_error
 from git_migration.state import StateStore, utc_now
 from git_migration.steps.runners import RunnerBlocked, discover_runner_ids
 from git_migration.steps.variables import destination_inheritance, explicit_values
@@ -164,26 +166,28 @@ def build_plan(
     planned_destinations = {repo.destination_path for repo in config.repositories}
     seen_groups: set[str] = set()
     for repo in config.repositories:
+        operation = "source project lookup"
         try:
             project = source.project(repo.source_path)
             if repo.strategy == "direct_transfer" and (explicit or experimental):
                 try:
                     source.get(f"/projects/{project['id']}/export_relations/status")
-                except Exception:
+                except Exception as error:
                     finding(
                         "blocker",
                         "source_transfer_access",
-                        "Cannot access the project's direct-transfer export endpoint; check project permissions and enabled imports",
+                        "Cannot access the project's direct-transfer export endpoint: "
+                        + safe_error(error)
+                        + " Check source project permissions and enabled imports.",
                         repo.source_path,
                     )
             if explicit:
                 try:
                     explicit_values(repo.ci_variables)
                 except Exception as error:
-                    from git_migration.secrets import safe_error
-
                     finding("blocker", "explicit_variables", safe_error(error), repo.source_path)
             existing = None
+            operation = "destination project lookup"
             try:
                 existing = destination.project(repo.destination_path)
             except Exception as error:
@@ -204,7 +208,23 @@ def build_plan(
                 ("schedules", "pipeline_schedules"),
                 ("environments", "environments"),
             ):
-                values = source.list(f"/projects/{project['id']}/{endpoint}")
+                operation = f"source project {endpoint} inventory"
+                try:
+                    values = source.list(f"/projects/{project['id']}/{endpoint}")
+                except ProviderError as error:
+                    if not (explicit and name == "variables" and error.status_code == 403):
+                        raise
+                    # Explicit reconciliation uses declared destination inputs, not
+                    # source values. Keep an unavailable count unknown, never zero.
+                    finding(
+                        "warning",
+                        "source_project_variables_unknown",
+                        "Source project variable inventory is inaccessible; count is unknown. "
+                        "project_explicit uses the declared ci_variables for destination "
+                        "reconciliation; review all required CI inputs. " + safe_error(error),
+                        repo.source_path,
+                    )
+                    continue
                 counts[name] = len(values)
                 if name == "schedules" and any(item.get("active") for item in values):
                     finding(
@@ -245,6 +265,7 @@ def build_plan(
                     "Pages deployment restoration is not selected; inspect whether a published site needs a separate cutover",
                     repo.source_path,
                 )
+            operation = "source project metadata validation"
             plan.repositories.append(
                 PlannedRepository(
                     source_path=repo.source_path,
@@ -281,7 +302,9 @@ def build_plan(
                             f"{source_path}: inherited variables are inaccessible or unknown, not preserved; review required CI inputs",
                         )
                 else:
+                    operation = f"source group lookup ({source_path})"
                     group = source.group(source_path)
+                    operation = f"source group membership check ({source_path})"
                     member = source.get(f"/groups/{group['id']}/members/all/{source_user['id']}")
                     if member.get("access_level", 0) < 50:
                         finding(
@@ -290,6 +313,7 @@ def build_plan(
                             f"Owner access is required to inspect inherited variables for {source_path}",
                         )
                         continue
+                    operation = f"source group variables inventory ({source_path})"
                     variables = source.list(f"/groups/{group['id']}/variables")
                 try:
                     target_path = config.map_group(source_path)
@@ -302,6 +326,7 @@ def build_plan(
                         )
                     continue
                 plan.groups[source_path] = target_path
+                operation = f"destination group lookup ({target_path})"
                 try:
                     target = destination.group(target_path)
                 except Exception as error:
@@ -333,6 +358,7 @@ def build_plan(
                             )
                     continue
                 if not destination_user.get("is_admin"):
+                    operation = f"destination group membership check ({target_path})"
                     target_member = destination.get(
                         f"/groups/{target['id']}/members/all/{destination_user['id']}"
                     )
@@ -343,6 +369,7 @@ def build_plan(
                             f"Owner access is required for destination group {target_path}",
                         )
                 if variables:
+                    operation = f"destination group projects inventory ({target_path})"
                     affected = destination.list(
                         f"/groups/{target['id']}/projects",
                         params={"include_subgroups": True, "with_shared": False},
@@ -360,7 +387,7 @@ def build_plan(
             finding(
                 "blocker",
                 "inventory_failed",
-                f"Could not inventory project or ancestor groups ({type(error).__name__}); check access and capabilities",
+                f"Inventory failed during {operation}: {safe_error(error)}",
                 repo.source_path,
             )
     try:
