@@ -63,6 +63,7 @@ def test_help_and_version_do_not_require_credentials() -> None:
             "--source-frozen and --destination-isolated",
         ),
         ("activate", [], "--source-frozen"),
+        ("activate", ["--allow-source-revision-drift"], "--source-frozen"),
     ],
 )
 def test_mutating_commands_require_explicit_attestations(
@@ -313,7 +314,14 @@ def test_malformed_yaml_is_sanitized(tmp_path: Path) -> None:
     assert "Traceback" not in result.output
 
 
-@pytest.mark.parametrize("extra", [[], ["--ci-api-isolated"]])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        [],
+        ["--ci-api-isolated"],
+        ["--allow-source-revision-drift", "--source-frozen", "--destination-isolated"],
+    ],
+)
 def test_smoke_requires_policy_and_trigger_isolation_attestation_before_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
 ) -> None:
@@ -435,3 +443,124 @@ def test_invalid_tag_correction_stops_before_state_or_provider_access(
     assert result.exit_code == 2
     assert "OLD=NEW[,NEW]" in result.output
     assert not state.exists()
+
+
+@pytest.mark.parametrize("flags", [[], ["--source-frozen"], ["--destination-isolated"]])
+def test_endpoint_refresh_requires_freeze_and_isolation_before_access(tmp_path, monkeypatch, flags):
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Attestations required")
+    )
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "verify",
+            "synthetic-run",
+            "--refresh-endpoints",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--source-frozen and --destination-isolated" in result.output
+    assert not state.exists()
+
+
+def test_endpoint_refresh_does_not_authorize_smoke(tmp_path):
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path / "state"),
+            "verify",
+            "synthetic-run",
+            "--refresh-endpoints",
+            "--source-frozen",
+            "--destination-isolated",
+            "--run-smoke",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--smoke-isolated" in result.output
+    assert not (tmp_path / "state").exists()
+
+
+def test_verify_passes_explicit_endpoint_refresh(tmp_path, monkeypatch):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["ci_api_isolated"] is True
+
+        def verify(self, run_smoke, pilot_workloads=None, *, refresh_endpoints=False):
+            received.append((run_smoke, pilot_workloads, refresh_endpoints))
+            return {"id": run, "status": "verified"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "verify",
+            run,
+            "--refresh-endpoints",
+            "--source-frozen",
+            "--destination-isolated",
+            "--run-smoke",
+            "--smoke-isolated",
+            "--ci-api-isolated",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == [(True, None, True)]
+
+
+@pytest.mark.parametrize("flags", [[], ["--source-frozen"], ["--destination-isolated"]])
+def test_source_revision_exception_requires_attestations(tmp_path, flags):
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path / "state"),
+            "verify",
+            "synthetic-run",
+            "--allow-source-revision-drift",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--source-frozen and --destination-isolated" in result.output
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("command", ["verify", "activate"])
+def test_source_revision_exception_is_passed_per_command(tmp_path, monkeypatch, command):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def verify(self, run_smoke, workloads, *, refresh_endpoints, allow_source_revision_drift):
+            assert not run_smoke and not refresh_endpoints
+            received.append(allow_source_revision_drift)
+            return {"id": run, "status": "verified"}
+
+        def activate(self, enable_schedules, *, allow_source_revision_drift):
+            assert not enable_schedules
+            received.append(allow_source_revision_drift)
+            return {"id": run, "status": "active"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    flags = ["--source-frozen", "--allow-source-revision-drift"]
+    if command == "verify":
+        flags.append("--destination-isolated")
+    result = runner.invoke(cli.app, ["--state-dir", str(tmp_path), command, run, *flags])
+    assert result.exit_code == 0, result.output
+    assert received == [True]

@@ -65,6 +65,33 @@ the identical correction resumes the same deterministic MR preparation without
 revising evidence again. A different correction is refused while preparation is
 incomplete, including an ambiguous remote write.
 
+`verify --refresh-endpoints` permits an explicit endpoint-evidence revision after
+all imports and CI preparation complete in a non-pilot, entirely Git-copy run,
+before activation. The default deployment-drift gate stays blocking. After CI
+recovery and quarantine/identity checks, a transaction records old/new metadata
+in `endpoint_revision_*`, updates the saved run's version fields and endpoint
+snapshot, and supersedes verification/smoke evidence without deleting it. Source
+and destination URLs cannot change. Configuration and its fingerprint are
+unchanged, and no plan/checkpoint schema conversion is needed; original plan
+files remain untouched. Native and mixed-strategy runs cannot use this opt-in.
+Commands loaded before a refresh stop at the workspace lock. Smoke markers and
+evidence include the durable endpoint generation after a refresh; generation zero
+preserves existing markers and checkpoint compatibility. Retries reuse the same
+generation, while a later refresh (even back to an earlier revision) requires a
+new pipeline. Verification checks versions again before marking the run verified,
+and activation rechecks before enabling execution.
+
+The separate runtime `--allow-source-revision-drift` option on verification and
+activation tolerates exactly the source revision field in non-pilot Git-copy
+runs. Source version/URL and the entire destination identity remain pinned;
+missing or invalid revisions block. Each distinct accepted planned/observed
+snapshot pair is durably recorded as `source_revision_observation_*` under the
+workspace lock before continuing. Observations do not modify the plan, hash,
+endpoint generation, or smoke evidence and do not authorize later commands.
+Both start/end checks honor the per-command choice, with full repository and CI
+verification between them. Existing plans/checkpoints need no format conversion;
+the default, native and mixed-strategy behavior stays strict.
+
 `--ci-api-isolated` is a per-command runtime attestation, so it does not change the
 saved-plan fingerprint or schema. On destination CI-API HTTP 403, eligible
 Git-copy commands can use a journaled, pipeline-denying CI configuration for

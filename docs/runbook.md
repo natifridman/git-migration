@@ -80,6 +80,22 @@ review, or activation. Resume the existing run rather than recreating the target
 
 ## 4. Verify before activation
 
+A GitLab version/revision change stops saved runs by default and identifies the
+changed endpoint and values. For a completed Git-copy run, follow the
+[explicit endpoint refresh procedure](git-copy.md#gitlab-changed-after-the-copy)
+with `verify --refresh-endpoints --source-frozen --destination-isolated`. It
+records the deployment change and requires new verification and smoke evidence
+on the existing destination. Native imports still need compatibility
+reconciliation; do not restart an import into an occupied project.
+
+For repeated source **build revision** changes with an unchanged source version
+and destination identity, Git-copy verification and activation support the
+narrower `--allow-source-revision-drift` opt-in, documented in that procedure.
+It audits accepted observations and retains valid destination smoke evidence.
+Reattest source freeze and destination isolation on `verify`, and repeat the
+opt-in with `--source-frozen` on `activate`. Frozen repository data and reviewed
+configuration are still verified on each command.
+
 If a Git-copy run has a job-tag mismatch and `runner_mrs` contains only unchanged
 configuration, use the [saved-run tag correction](git-copy.md#correct-a-missing-tag-mapping-after-git-copy)
 after confirming the intended runner fleet. `resume --runner-tag-map OLD=NEW` is

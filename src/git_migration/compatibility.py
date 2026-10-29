@@ -45,15 +45,98 @@ def endpoint_snapshot(config: MigrationConfig, source: Any, destination: Any) ->
     return result
 
 
-def verify_endpoints(plan: MigrationPlan, source: Any, destination: Any) -> None:
-    # Legacy strict runs predate revision recording. New plans always pin identities.
+def _source_revision_only(plan: MigrationPlan, current: dict[str, dict[str, str]]) -> bool:
     if (
-        plan.endpoint_snapshot
-        and endpoint_snapshot(plan.config, source, destination) != plan.endpoint_snapshot
+        plan.pilot
+        or not plan.config.repositories
+        or any(repo.strategy != "git_copy" for repo in plan.config.repositories)
     ):
-        raise CompatibilityBlocked(
-            "GitLab version or revision changed; generate a fresh plan and pilot evidence"
+        return False
+    # Exactly one field may vary; missing or malformed revisions are not tolerated.
+    expected = {side: dict(metadata) for side, metadata in plan.endpoint_snapshot.items()}
+    if any(
+        not re.fullmatch(r"[a-fA-F0-9]{7,64}", revision)
+        for revision in (
+            expected.get("source", {}).get("revision", ""),
+            current["source"]["revision"],
+            current["destination"]["revision"],
         )
+    ):
+        return False
+    expected["source"]["revision"] = current["source"]["revision"]
+    return current == expected
+
+
+def verify_endpoints(
+    plan: MigrationPlan, source: Any, destination: Any, *, allow_source_revision_drift: bool = False
+) -> dict[str, dict[str, str]] | None:
+    # Legacy strict runs predate revision recording. New plans always pin identities.
+    if not plan.endpoint_snapshot:
+        return None
+    current = endpoint_snapshot(plan.config, source, destination)
+    if current != plan.endpoint_snapshot:
+        source_revision_only = _source_revision_only(plan, current)
+        if allow_source_revision_drift and source_revision_only:
+            return current
+        details = []
+        for side in ("source", "destination"):
+            old, new = plan.endpoint_snapshot.get(side, {}), current[side]
+            if old.get("url") != new["url"]:
+                details.append(f"{side} endpoint URL changed")
+            for field in ("version", "revision"):
+                before, after = old.get(field, ""), new[field]
+                if before != after:
+                    pattern = (
+                        r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?"
+                        if field == "version"
+                        else r"[a-fA-F0-9]{7,64}"
+                    )
+                    before = before if re.fullmatch(pattern, before) else "unavailable"
+                    details.append(f"{side} {field}: {before} -> {after or 'unavailable'}")
+        guidance = (
+            "For Git copy, use --allow-source-revision-drift to audit source build changes while "
+            "keeping versions and destination identity pinned; verify also requires --source-frozen "
+            "and --destination-isolated. Repeat the opt-in on activate"
+            if source_revision_only
+            else "For a completed Git-copy import, review this change and use verify --refresh-endpoints "
+            "--source-frozen --destination-isolated on the same run; fresh verification is required"
+            if all(repo.strategy == "git_copy" for repo in plan.config.repositories)
+            else "Native transfer compatibility needs reconciliation; retain this run and generate fresh plan/pilot evidence as required"
+        )
+        raise CompatibilityBlocked(
+            "GitLab version or revision changed; " + "; ".join(details) + ". " + guidance
+        )
+    return None
+
+
+def validate_endpoint_refresh(plan: MigrationPlan, current: dict[str, dict[str, str]]) -> None:
+    """Only a fully pinned Git-copy run can accept new versions at the same endpoints."""
+    if (
+        plan.pilot
+        or not plan.config.repositories
+        or any(repo.strategy != "git_copy" for repo in plan.config.repositories)
+    ):
+        raise CompatibilityBlocked("Endpoint refresh is available only for non-pilot Git-copy runs")
+    if set(plan.endpoint_snapshot) != {"source", "destination"} or set(current) != {
+        "source",
+        "destination",
+    }:
+        raise CompatibilityBlocked(
+            "Endpoint refresh requires complete saved and current identities"
+        )
+    for side, endpoint in (
+        ("source", plan.config.source),
+        ("destination", plan.config.destination),
+    ):
+        for snapshot in (plan.endpoint_snapshot, current):
+            metadata = snapshot[side]
+            if set(metadata) != {"url", "version", "revision"} or metadata["url"] != endpoint.url:
+                raise CompatibilityBlocked(
+                    "Endpoint refresh cannot change source or destination URLs"
+                )
+            version_number(metadata["version"])
+            if not re.fullmatch(r"[a-fA-F0-9]{7,64}", metadata["revision"]):
+                raise CompatibilityBlocked("Endpoint refresh requires known GitLab revisions")
 
 
 PILOT_COVERAGE = {

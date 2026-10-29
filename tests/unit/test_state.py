@@ -1,5 +1,6 @@
 """Exercise durable checkpointing and actual cross-process writer exclusion."""
 
+import copy
 import os
 import sqlite3
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from git_migration.compatibility import CompatibilityBlocked
 from git_migration.models import MigrationConfig, MigrationPlan
 from git_migration.state import RunnerTagRevisionBlocked, StateStore, atomic_json
 
@@ -299,3 +301,144 @@ def test_runner_tag_revision_rolls_back_audit_and_invalidations_on_write_failure
         store.revise_runner_tags(run, {"old-linux": ["approved"]}, saved.config_hash)
     assert StateStore(store.root).report(run) == before
     assert store.plan(run) == saved
+
+
+@pytest.fixture
+def endpoint_run(tag_revision_run):
+    store, run, saved = tag_revision_run
+    saved.source_version = saved.destination_version = "18.4.1"
+    saved.endpoint_snapshot = {
+        "source": {"url": saved.config.source.url, "version": "18.4.1", "revision": "a" * 40},
+        "destination": {
+            "url": saved.config.destination.url,
+            "version": "18.4.1",
+            "revision": "b" * 40,
+        },
+    }
+    with store.connection() as db:
+        db.execute("UPDATE runs SET plan=? WHERE id=?", (saved.model_dump_json(), run))
+    store.save(run, "team/repo", "smoke", "complete", {"pipeline_id": 88, "jobs": [{"job_id": 99}]})
+    current = copy.deepcopy(saved.endpoint_snapshot)
+    current["source"]["revision"] = "c" * 40
+    current["destination"]["version"] = "18.4.2"
+    return store, run, saved, current
+
+
+def test_endpoint_refresh_audits_drift_and_supersedes_evidence_atomically(endpoint_run):
+    store, run, saved, current = endpoint_run
+    before = {step["name"]: step for step in store.report(run)["steps"]}
+    updated = store.refresh_endpoints(run, saved, current)
+    assert store.plan(run) == updated
+    assert updated.endpoint_snapshot == current
+    assert updated.source_version == "18.4.1"
+    assert updated.destination_version == "18.4.2"
+    assert updated.config == saved.config
+    assert updated.config_hash == saved.config_hash == updated.config.fingerprint()
+    assert store.report(run)["status"] == "awaiting_verification"
+    assert store.endpoint_generation(run) == 1
+    for name in ("import", "snapshot", "baseline_verified", "runner_mrs", "preparation"):
+        assert store.step(run, "team/repo", name) == before[name]
+    audit = store.step(run, "run", "endpoint_revision_1")["data"]
+    assert audit["previous_endpoint_snapshot"] == saved.endpoint_snapshot
+    assert audit["endpoint_snapshot"] == current
+    assert {step["name"]: step for step in audit["superseded_steps"]} == {
+        name: before[name] for name in ("verification", "smoke")
+    }
+    for name in ("verification", "smoke"):
+        assert store.step(run, "team/repo", name)["status"] == "superseded"
+        assert store.step(run, "team/repo", name)["data"] == before[name]["data"]
+    # Identical retries after a crash do not create another generation or reset new evidence.
+    store.save(run, "team/repo", "verification", "failed", {"error": "Interrupted"})
+    report = store.report(run)
+    restarted = StateStore(store.root)
+    assert restarted.refresh_endpoints(run, updated, current) == updated
+    assert restarted.report(run) == report
+    assert restarted.endpoint_generation(run) == 1
+    # Returning to an older GitLab revision still requires a new smoke generation.
+    assert (
+        restarted.refresh_endpoints(run, updated, saved.endpoint_snapshot).endpoint_snapshot
+        == saved.endpoint_snapshot
+    )
+    assert restarted.endpoint_generation(run) == 2
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "active",
+        "native",
+        "mixed",
+        "pilot",
+        "incomplete_import",
+        "incomplete_preparation",
+        "activation",
+        "missing_snapshot",
+        "changed_url",
+        "unknown_revision",
+        "invalid_revision",
+        "invalid_version",
+        "stale_plan",
+        "bad_hash",
+    ],
+)
+def test_endpoint_refresh_refuses_unsafe_state_without_mutation(endpoint_run, fault):
+    store, run, saved, current = endpoint_run
+    if fault in {"native", "mixed", "pilot", "missing_snapshot", "bad_hash"}:
+        if fault == "native":
+            saved.config.repositories[0].strategy = "direct_transfer"
+        elif fault == "mixed":
+            saved.config.repositories.append(
+                saved.config.repositories[0].model_copy(
+                    update={
+                        "source_path": "team/second",
+                        "destination_path": "new/second",
+                        "strategy": "direct_transfer",
+                    }
+                )
+            )
+        elif fault == "pilot":
+            saved.pilot = True
+        elif fault == "missing_snapshot":
+            saved.endpoint_snapshot = {}
+        saved.config_hash = "invalid" if fault == "bad_hash" else saved.config.fingerprint()
+        with store.connection() as db:
+            db.execute("UPDATE runs SET plan=? WHERE id=?", (saved.model_dump_json(), run))
+    elif fault == "active":
+        store.set_status(run, "active")
+    elif fault in {"incomplete_import", "incomplete_preparation", "activation"}:
+        name = {
+            "incomplete_import": "import",
+            "incomplete_preparation": "preparation",
+            "activation": "activation",
+        }[fault]
+        store.save(run, "team/repo", name, "failed", {"identity": "retain"})
+    elif fault == "changed_url":
+        current["source"]["url"] = "https://different.example"
+    elif fault == "unknown_revision":
+        current["source"]["revision"] = ""
+    elif fault == "invalid_revision":
+        current["source"]["revision"] = "synthetic-sensitive-marker"
+    elif fault == "invalid_version":
+        current["source"]["version"] = "synthetic-sensitive-marker"
+    elif fault == "stale_plan":
+        saved.endpoint_snapshot["source"]["revision"] = "f" * 40
+    before, before_plan = store.report(run), store.plan(run)
+    with pytest.raises(CompatibilityBlocked) as error:
+        store.refresh_endpoints(run, saved, current)
+    assert "synthetic-sensitive-marker" not in str(error.value)
+    assert store.report(run) == before
+    assert store.plan(run) == before_plan
+    assert store.endpoint_generation(run) == 0
+
+
+def test_endpoint_refresh_rolls_back_audit_invalidation_and_plan_on_failure(endpoint_run):
+    store, run, saved, current = endpoint_run
+    before = store.report(run)
+    with store.connection() as db:
+        db.execute("""CREATE TRIGGER fail_refresh BEFORE UPDATE OF plan ON runs
+                      BEGIN SELECT RAISE(ABORT, 'synthetic crash'); END""")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.refresh_endpoints(run, saved, current)
+    assert StateStore(store.root).report(run) == before
+    assert store.plan(run) == saved
+    assert store.endpoint_generation(run) == 0

@@ -14,7 +14,12 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from git_migration.compatibility import pilot_evidence, verify_endpoints
+from git_migration.compatibility import (
+    endpoint_snapshot,
+    pilot_evidence,
+    validate_endpoint_refresh,
+    verify_endpoints,
+)
 from git_migration.git import snapshot_repository
 from git_migration.models import MigrationPlan, Repository, RunnerProfile
 from git_migration.providers import ProviderError, clients_for
@@ -60,6 +65,7 @@ class Migrator:
         ci_api_isolated: bool = False,
     ) -> None:
         self.plan, self.store, self.run_id = plan, store, run_id
+        self._endpoint_generation = store.endpoint_generation(run_id)
         self.ci_api_isolated = ci_api_isolated
         self._source: Any
         self._destination: Any
@@ -107,10 +113,16 @@ class Migrator:
     @contextmanager
     def _operation(self) -> Iterator[None]:
         with self.store.lock():
-            if self.store.plan(self.run_id).config_hash != self.plan.config_hash:
+            saved_plan = self.store.plan(self.run_id)
+            if saved_plan.config_hash != self.plan.config_hash:
                 raise MigrationBlocked(
                     "Saved configuration changed; reload the run before retrying"
                 )
+            if (
+                saved_plan.endpoint_snapshot != self.plan.endpoint_snapshot
+                or self.store.endpoint_generation(self.run_id) != self._endpoint_generation
+            ):
+                raise MigrationBlocked("Saved endpoints changed; reload the run before retrying")
             if self.store.report(self.run_id)["status"] == "active":
                 raise MigrationBlocked("Run is already active; use report to inspect it")
             self._cancel.clear()
@@ -336,7 +348,36 @@ class Migrator:
                 )
         return okay
 
-    def _check_environment(self) -> None:
+    def _check_endpoints(self, allow_source_revision_drift: bool = False) -> None:
+        observed = verify_endpoints(
+            self.plan,
+            self.source,
+            self.destination,
+            allow_source_revision_drift=allow_source_revision_drift,
+        )
+        if observed is not None:
+            evidence = {
+                "planned_endpoint_snapshot": self.plan.endpoint_snapshot,
+                "observed_endpoint_snapshot": observed,
+            }
+            identity = hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()[
+                :20
+            ]
+            name = f"source_revision_observation_{identity}"
+            if self.store.step(self.run_id, "run", name) is None:
+                self.store.save(
+                    self.run_id,
+                    "run",
+                    name,
+                    "complete",
+                    {
+                        **evidence,
+                        "observed_at": utc_now(),
+                        "source_revision_drift_accepted": True,
+                    },
+                )
+
+    def _check_environment(self, allow_source_revision_drift: bool = False) -> None:
         if self.plan.config.compatibility.mode == "experimental_direct_transfer" and (
             set(self.plan.endpoint_snapshot) != {"source", "destination"}
             or any(not value.get("revision") for value in self.plan.endpoint_snapshot.values())
@@ -344,12 +385,28 @@ class Migrator:
             raise MigrationBlocked(
                 "Experimental run lacks pinned endpoint revisions; generate a fresh plan"
             )
-        verify_endpoints(self.plan, self.source, self.destination)
+        self._check_endpoints(allow_source_revision_drift)
         blockers = pilot_evidence(self.plan, self.store)
         if blockers:
             raise MigrationBlocked("; ".join(blockers))
         if self.plan.config.variables.mode == "project_explicit":
             verify_destination_inheritance(self.plan, self.destination)
+
+    def _refresh_endpoints(self) -> None:
+        validate_endpoint_refresh(self.plan, self.plan.endpoint_snapshot)
+        current = endpoint_snapshot(self.plan.config, self.source, self.destination)
+        validate_endpoint_refresh(self.plan, current)
+        for repo in self.plan.config.repositories:
+            target = self._target(repo)
+            if (
+                target.get("builds_access_level") != "disabled"
+                or target.get("auto_devops_enabled") is not False
+            ):
+                raise MigrationBlocked(
+                    "Endpoint refresh requires destination CI and Auto DevOps disabled"
+                )
+        self.plan = self.store.refresh_endpoints(self.run_id, self.plan, current)
+        self._endpoint_generation = self.store.endpoint_generation(self.run_id)
 
     def _variables(
         self, repo: Repository, source_id: int, target_id: int, *, write: bool, no_ci: bool = False
@@ -430,7 +487,10 @@ class Migrator:
         if not imported or imported["status"] != "complete":
             raise MigrationBlocked("Project import is not complete")
         target = self.destination.project(imported["data"]["destination_id"])
-        if target.get("path_with_namespace") != repo.destination_path:
+        if (
+            target.get("id") != imported["data"]["destination_id"]
+            or target.get("path_with_namespace") != repo.destination_path
+        ):
             raise MigrationBlocked("Destination project identity changed")
         return dict(target)
 
@@ -853,11 +913,17 @@ class Migrator:
                     target,
                     runner_profile.model_dump(),
                     self._directory(repo),
-                    marker=f"migration-{self.run_id}",
+                    marker=f"migration-{self.run_id}"
+                    + (
+                        f"-endpoints-{self._endpoint_generation}"
+                        if self._endpoint_generation
+                        else ""
+                    ),
                     required_tag_sets=[list(tags) for tags in tag_sets],
                     schedules_verified=self.ci_api_isolated and schedules is not None,
                 )
                 smoke_result["ref_digest"] = ref_digest
+                smoke_result["endpoint_generation"] = self._endpoint_generation
                 self._save(
                     repo,
                     "smoke",
@@ -871,6 +937,7 @@ class Migrator:
                     or smoke["status"] != "complete"
                     or not smoke["data"].get("jobs")
                     or smoke["data"].get("ref_digest") != ref_digest
+                    or smoke["data"].get("endpoint_generation", 0) != self._endpoint_generation
                 ):
                     result["blockers"].append(
                         "Smoke evidence is missing; resolve the blockers above before rerunning verify --run-smoke --smoke-isolated"
@@ -898,6 +965,7 @@ class Migrator:
                                 "Smoke job identity differs from recorded evidence"
                             )
             result["ref_digest"] = ref_digest
+            result["endpoint_generation"] = self._endpoint_generation
             result["has_ci_jobs"] = bool(jobs)
             result["smoke_required"] = bool(jobs)
             if not jobs:
@@ -1009,7 +1077,12 @@ class Migrator:
             return False
 
     def verify(
-        self, run_smoke: bool = False, pilot_workloads: dict[str, int] | None = None
+        self,
+        run_smoke: bool = False,
+        pilot_workloads: dict[str, int] | None = None,
+        *,
+        refresh_endpoints: bool = False,
+        allow_source_revision_drift: bool = False,
     ) -> dict[str, Any]:
         if pilot_workloads and (
             not self.plan.pilot
@@ -1020,7 +1093,9 @@ class Migrator:
             )
         with self._operation():
             self._recover_smokes()
-            self._check_environment()
+            if refresh_endpoints:
+                self._refresh_endpoints()
+            self._check_environment(allow_source_revision_drift)
             groups_ready = self._groups(verify_only=True)
             ready = self._parallel(
                 lambda repo: self._verify(repo, run_smoke), self.plan.config.repositories
@@ -1031,22 +1106,26 @@ class Migrator:
                         ready = (
                             self._pilot_workload(repo, pilot_workloads[repo.source_path]) and ready
                         )  # type: ignore[index]
+            self._check_endpoints(allow_source_revision_drift)
             self.store.set_status(self.run_id, "verified" if groups_ready and ready else "blocked")
             return self.report()
 
-    def activate(self, enable_schedules: bool = False) -> dict[str, Any]:
+    def activate(
+        self, enable_schedules: bool = False, *, allow_source_revision_drift: bool = False
+    ) -> dict[str, Any]:
         if self.plan.pilot:
             raise MigrationBlocked(
                 "Pilot runs cannot be activated; create a production plan referencing verified pilot evidence"
             )
         with self._operation():
             self._recover_smokes()
-            self._check_environment()
+            self._check_environment(allow_source_revision_drift)
             groups_ready = self._groups(verify_only=True)
             ready = self._parallel(self._verify, self.plan.config.repositories)
             if not ready or not groups_ready:
                 self.store.set_status(self.run_id, "blocked")
                 return self.report()
+            self._check_endpoints(allow_source_revision_drift)
             if enable_schedules and not self.plan.config.features.schedules:
                 raise MigrationBlocked("Schedule restoration was not selected in this manifest")
             schedule_mappings: dict[str, dict[int, int]] = {}

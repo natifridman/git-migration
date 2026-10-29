@@ -194,6 +194,77 @@ enable project CI or start another `apply` to get around a blocked existing run.
 
 ## Plan and run
 
+### GitLab changed after the copy
+
+Saved runs pin both GitLab versions and build revisions. A deployment can change
+the revision even when the version string stays the same. Commands stop by
+default and report the old/new values for the affected endpoint. This check is
+separate from the source/destination version gap used for native imports.
+
+For a completed non-pilot Git-copy run, review that change and confirm that the
+source freeze and destination isolation still hold. Keep the existing run:
+
+```sh
+uv run --locked git-migrate verify RUN_ID \
+  --refresh-endpoints --source-frozen --destination-isolated \
+  --run-smoke --smoke-isolated --ci-api-isolated
+```
+
+Use the CI API flag only under its isolation conditions above. For a project
+without CI, omit the smoke flags. Refresh is available only on `verify`, requires
+completed import/baseline and CI preparation for every repository, and refuses
+native or mixed-strategy runs, pilots, active runs, or any prior activation
+attempt. Both saved/current endpoint URLs must match the saved configuration;
+versions and revisions must be readable and valid. Destination identity, disabled
+CI, and disabled Auto DevOps are checked before accepting the refresh.
+
+The refresh atomically records old/new endpoint identities in
+`endpoint_revision_*` and supersedes prior verification and smoke evidence while
+preserving it for audit. Imported project IDs, Git snapshots, policies, variables,
+and CI MR evidence stay in the same run. Verification checks them again, including
+reviewed MR merges. Projects with CI need a fresh smoke pipeline whose identity is
+tied to this refresh; a pipeline from before the deployment cannot satisfy it.
+Interrupted retries retain the same refresh and smoke identity. If a version or
+revision changes again during verification or before activation, the check blocks
+again. Activation remains a separate command after verification succeeds.
+
+This does not modify the original plan JSON or manifest. Do not restart `apply`
+against the occupied destination or manually alter the saved endpoint snapshot.
+Native import compatibility changes still require separate reconciliation and
+new compatibility evidence where applicable.
+
+If only the **source build revision** keeps changing while its exact version
+string stays the same, use the narrower per-command opt-in:
+
+```sh
+uv run --locked git-migrate verify RUN_ID \
+  --allow-source-revision-drift --source-frozen --destination-isolated \
+  --ci-api-isolated
+# After verification succeeds:
+uv run --locked git-migrate activate RUN_ID \
+  --allow-source-revision-drift --source-frozen --ci-api-isolated
+```
+
+This accepts only source-revision changes for non-pilot Git-copy runs. Both URLs,
+the exact source version, and the destination version/revision remain pinned.
+Known, valid revisions are required. Native or mixed-strategy runs cannot use
+the exception to accept drift. Each distinct accepted observation is retained in
+`source_revision_observation_*` and shown in the report. The saved endpoint
+snapshot, configuration fingerprint, and smoke generation do not change.
+Repeat the flag on each `verify` or `activate` command; observations do not grant
+an ongoing exception. `apply` and `resume` retain strict endpoint checks.
+
+If an earlier command passed repository verification and its destination smoke
+test, then failed only the final source-revision comparison, rerun verification
+with the command above. It rechecks frozen Git data, reviewed CI, variables,
+runner eligibility, and recorded smoke job identities, retaining the successful
+smoke evidence. If smoke evidence is missing, add `--run-smoke --smoke-isolated`.
+All freeze, isolation, review, and activation gates remain required. A changed
+source version or any changed destination version/revision still blocks and
+requires the full refresh procedure and fresh smoke evidence.
+
+### Start a new run
+
 Supply the ordinary source/destination tokens and any replacement-variable
 environment references, then generate a normal plan, without `--pilot`:
 

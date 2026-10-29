@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from git_migration.compatibility import CompatibilityBlocked, validate_endpoint_refresh
 from git_migration.models import MigrationPlan
 from git_migration.secrets import SafeError
 
@@ -220,6 +221,89 @@ class StateStore:
                 )
             db.execute(
                 "UPDATE runs SET plan=?,status='preparing' WHERE id=?",
+                (plan.model_dump_json(), run_id),
+            )
+            return plan
+
+    def endpoint_generation(self, run_id: str) -> int:
+        with self.connection() as db:
+            return int(
+                db.execute(
+                    "SELECT count(*) FROM steps WHERE run_id=? AND resource='run' AND name GLOB 'endpoint_revision_[0-9]*'",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+
+    def refresh_endpoints(
+        self, run_id: str, expected: MigrationPlan, current: dict[str, dict[str, str]]
+    ) -> MigrationPlan:
+        """Caller holds the workspace lock and has recovered CI and checked quarantine."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise CompatibilityBlocked("Unknown migration run")
+            plan = MigrationPlan.model_validate_json(run["plan"])
+            if plan != expected or plan.config_hash != plan.config.fingerprint():
+                raise CompatibilityBlocked(
+                    "Saved plan changed; reload the run before endpoint refresh"
+                )
+            validate_endpoint_refresh(plan, current)
+            if run["status"] == "active":
+                raise CompatibilityBlocked("Active runs cannot refresh endpoints")
+            rows = db.execute("SELECT * FROM steps WHERE run_id=?", (run_id,)).fetchall()
+            steps = {
+                (row["resource"], row["name"]): {**dict(row), "data": json.loads(row["data"])}
+                for row in rows
+            }
+            resources = {repo.source_path for repo in plan.config.repositories}
+            for resource in resources:
+                if (resource, "activation") in steps or any(
+                    steps.get((resource, name), {}).get("status") != "complete"
+                    for name in (
+                        "snapshot",
+                        "import",
+                        "baseline_verified",
+                        "runner_mrs",
+                        "preparation",
+                    )
+                ):
+                    raise CompatibilityBlocked(
+                        "Endpoint refresh requires completed import and preparation, before any activation attempt"
+                    )
+            if current == plan.endpoint_snapshot:
+                return plan
+            generation = 1 + sum(
+                resource == "run" and name.startswith("endpoint_revision_")
+                for resource, name in steps
+            )
+            superseded = [
+                step
+                for (resource, name), step in steps.items()
+                if resource in resources
+                and name in {"verification", "smoke", "schedule_verification"}
+            ]
+            audit = {
+                "generation": generation,
+                "previous_endpoint_snapshot": plan.endpoint_snapshot,
+                "endpoint_snapshot": current,
+                "superseded_steps": superseded,
+            }
+            plan.endpoint_snapshot = current
+            plan.source_version = current["source"]["version"]
+            plan.destination_version = current["destination"]["version"]
+            now = utc_now()
+            db.execute(
+                "INSERT INTO steps VALUES (?, 'run', ?, 'complete', ?, ?)",
+                (run_id, f"endpoint_revision_{generation}", json.dumps(audit), now),
+            )
+            for step in superseded:
+                db.execute(
+                    "UPDATE steps SET status='superseded',updated_at=? WHERE run_id=? AND resource=? AND name=?",
+                    (now, run_id, step["resource"], step["name"]),
+                )
+            db.execute(
+                "UPDATE runs SET plan=?,status='awaiting_verification' WHERE id=?",
                 (plan.model_dump_json(), run_id),
             )
             return plan
