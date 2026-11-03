@@ -626,6 +626,7 @@ class Migrator:
                         item.source_path: item.destination_path
                         for item in self.plan.config.repositories
                     },
+                    omit_project_includes=repo.omit_ci_project_includes,
                 )
                 if result.get("status") == "no_ci" and (
                     source_project.get("auto_devops_enabled") is not False
@@ -635,6 +636,8 @@ class Migrator:
                         "No-CI preparation requires no custom source CI path and explicitly disabled Auto DevOps"
                     )
                 result["target_branch"] = branch
+                if repo.omit_ci_project_includes:
+                    result["omit_ci_project_includes"] = repo.omit_ci_project_includes
                 result.setdefault(
                     "source_sha", baseline["data"]["snapshot"]["refs"].get(f"refs/heads/{branch}")
                 )
@@ -687,16 +690,23 @@ class Migrator:
             self._failed(repo, "preparation", error)
             return False
 
-    def prepare(self, runner_tag_map: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    def prepare(
+        self,
+        runner_tag_map: dict[str, list[str]] | None = None,
+        *,
+        omit_ci_project_includes: list[str] | None = None,
+    ) -> dict[str, Any]:
         if self.plan.blocked:
             raise MigrationBlocked("Resolve plan blockers before applying")
+        if runner_tag_map and omit_ci_project_includes:
+            raise MigrationBlocked("Correct runner tags and CI include omissions separately")
         with self._operation():
             smoke_attempted = (
                 any(
                     any(self._directory(repo).glob("smoke-*.json"))
                     for repo in self.plan.config.repositories
                 )
-                if runner_tag_map
+                if runner_tag_map or omit_ci_project_includes
                 else False
             )
             self._recover_smokes()
@@ -711,6 +721,18 @@ class Migrator:
                     )
                 self.plan = self.store.revise_runner_tags(
                     self.run_id, runner_tag_map, self.plan.config_hash
+                )
+            if omit_ci_project_includes:
+                if smoke_attempted and any(
+                    path not in repo.omit_ci_project_includes
+                    for repo in self.plan.config.repositories
+                    for path in omit_ci_project_includes
+                ):
+                    raise MigrationBlocked(
+                        "CI include omission refused: smoke recovery or ownership evidence already exists"
+                    )
+                self.plan = self.store.revise_ci_include_omissions(
+                    self.run_id, omit_ci_project_includes, self.plan.config_hash
                 )
             ensure_groups(self.plan, self.destination)
             imported = self._parallel(self._import, self.plan.config.repositories)

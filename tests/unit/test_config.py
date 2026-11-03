@@ -63,6 +63,7 @@ def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None
     for repo in original["repositories"]:
         repo.pop("ci_variables")
         repo.pop("skip_merge_request_history")
+        repo.pop("omit_ci_project_includes")
     old_hash = hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest()
     path = tmp_path / "plan.json"
     path.write_text(
@@ -77,6 +78,33 @@ def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None
         )
     )
     assert load_plan(path).config_hash == old_hash
+
+
+def test_ci_include_omissions_are_explicit_and_fingerprinted():
+    data = manifest()
+    original = MigrationConfig.model_validate(data).fingerprint()
+    data["repositories"][0]["omit_ci_project_includes"] = []
+    assert MigrationConfig.model_validate(data).fingerprint() == original
+    data["repositories"][0]["omit_ci_project_includes"] = ["team/optional-review"]
+    assert MigrationConfig.model_validate(data).fingerprint() != original
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        ["$TEMPLATE"],
+        ["https://source.example/team/templates"],
+        ["team/templates", "team/templates"],
+        ["team/../templates"],
+        [" team/templates"],
+        ["team/templates/"],
+    ],
+)
+def test_ci_include_omissions_require_unique_literal_paths(paths):
+    data = manifest()
+    data["repositories"][0]["omit_ci_project_includes"] = paths
+    with pytest.raises(ValidationError):
+        MigrationConfig.model_validate(data)
 
 
 @pytest.mark.parametrize("strategy", ["direct_transfer", "file_export"])

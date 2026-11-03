@@ -11,7 +11,12 @@ import pytest
 
 from git_migration.compatibility import CompatibilityBlocked
 from git_migration.models import MigrationConfig, MigrationPlan
-from git_migration.state import RunnerTagRevisionBlocked, StateStore, atomic_json
+from git_migration.state import (
+    CIIncludeRevisionBlocked,
+    RunnerTagRevisionBlocked,
+    StateStore,
+    atomic_json,
+)
 
 
 def plan() -> MigrationPlan:
@@ -299,6 +304,136 @@ def test_runner_tag_revision_rolls_back_audit_and_invalidations_on_write_failure
                       BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END""")
     with pytest.raises(sqlite3.IntegrityError):
         store.revise_runner_tags(run, {"old-linux": ["approved"]}, saved.config_hash)
+    assert StateStore(store.root).report(run) == before
+    assert store.plan(run) == saved
+
+
+@pytest.fixture
+def include_revision_run(tag_revision_run):
+    store, run, saved = tag_revision_run
+    request = store.step(run, "team/repo", "runner_mrs")["data"]["requests"][0]
+    request.update(
+        status="blocked", blockers=["Project CI include requires an explicit destination mapping"]
+    )
+    store.save(run, "team/repo", "runner_mrs", "blocked", {"requests": [request]})
+    return store, run, saved
+
+
+def test_ci_omission_revision_preserves_import_and_audits_old_checkpoints(include_revision_run):
+    store, run, saved = include_revision_run
+    before = {step["name"]: step for step in store.report(run)["steps"]}
+    updated = store.revise_ci_include_omissions(run, ["team/optional-review"], saved.config_hash)
+    expected = saved.model_copy(deep=True)
+    expected.config.repositories[0].omit_ci_project_includes = ["team/optional-review"]
+    expected.config_hash = expected.config.fingerprint()
+    assert StateStore(store.root).plan(run) == updated == expected
+    for name in ("snapshot", "import", "baseline_verified"):
+        assert store.step(run, "team/repo", name) == before[name]
+    audit = store.step(run, "team/repo", "ci_include_revision_1")["data"]
+    assert audit["previous_config_hash"] == saved.config_hash
+    assert audit["config_hash"] == expected.config_hash != saved.config_hash
+    assert audit["previous_omit_ci_project_includes"] == []
+    assert audit["omit_ci_project_includes"] == ["team/optional-review"]
+    assert audit["superseded_steps"] == {
+        name: before[name] for name in ("runner_mrs", "preparation", "verification")
+    }
+    for name in audit["superseded_steps"]:
+        assert store.step(run, "team/repo", name)["status"] == "superseded"
+    before_retry = store.report(run)
+    assert (
+        store.revise_ci_include_omissions(run, ["team/optional-review"], expected.config_hash)
+        == expected
+    )
+    assert store.report(run) == before_retry
+    with pytest.raises(CIIncludeRevisionBlocked):
+        store.revise_ci_include_omissions(run, ["team/another"], expected.config_hash)
+    store.save(run, "team/repo", "runner_mrs", "complete", {"requests": [{"iid": 21}]})
+    assert (
+        store.revise_ci_include_omissions(run, ["team/optional-review"], expected.config_hash)
+        == expected
+    )
+    with pytest.raises(CIIncludeRevisionBlocked):
+        store.revise_ci_include_omissions(run, ["team/another"], expected.config_hash)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "native",
+        "pilot",
+        "batch",
+        "active",
+        "stale_hash",
+        "bad_fingerprint",
+        "import",
+        "preparing",
+        "superseded",
+        "iid",
+        "branch",
+        "commit_sha",
+        "changed",
+        "source_sha",
+        "other_blocker",
+        "checkpoint_error",
+        "smoke",
+        "activation",
+    ],
+)
+def test_ci_omission_refuses_ambiguous_or_unsafe_state(include_revision_run, fault):
+    store, run, saved = include_revision_run
+    if fault in {"native", "pilot", "batch", "bad_fingerprint"}:
+        if fault == "native":
+            saved.config.repositories[0].strategy = "direct_transfer"
+        elif fault == "pilot":
+            saved.pilot = True
+        elif fault == "batch":
+            saved.config.repositories.append(
+                saved.config.repositories[0].model_copy(
+                    update={"source_path": "team/second", "destination_path": "new/second"}
+                )
+            )
+        saved.config_hash = "invalid" if fault == "bad_fingerprint" else saved.config.fingerprint()
+        with store.connection() as db:
+            db.execute("UPDATE runs SET plan=? WHERE id=?", (saved.model_dump_json(), run))
+    elif fault == "active":
+        store.set_status(run, "active")
+    elif fault == "stale_hash":
+        saved.config_hash = "stale"
+    elif fault in {"import", "smoke", "activation"}:
+        store.save(run, "team/repo", fault, "failed", {"operation": "retain"})
+    else:
+        step = store.step(run, "team/repo", "runner_mrs")
+        request = step["data"]["requests"][0]
+        if fault in {"iid", "branch", "commit_sha", "source_sha"}:
+            request[fault] = "remote-evidence"
+        elif fault == "changed":
+            request["changed"] = True
+        elif fault == "other_blocker":
+            request["blockers"].append("Manual review required")
+        elif fault == "checkpoint_error":
+            step["data"]["error"] = "Uncertain remote write"
+        store.save(
+            run,
+            "team/repo",
+            "runner_mrs",
+            fault if fault in {"preparing", "superseded"} else "blocked",
+            step["data"],
+        )
+    before, original = store.report(run), store.plan(run)
+    with pytest.raises(CIIncludeRevisionBlocked):
+        store.revise_ci_include_omissions(run, ["team/optional-review"], saved.config_hash)
+    assert store.report(run) == before
+    assert store.plan(run) == original
+
+
+def test_ci_omission_revision_transaction_rolls_back(include_revision_run):
+    store, run, saved = include_revision_run
+    before = store.report(run)
+    with store.connection() as db:
+        db.execute("""CREATE TRIGGER fail_revision BEFORE UPDATE OF plan ON runs
+                      BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.revise_ci_include_omissions(run, ["team/optional-review"], saved.config_hash)
     assert StateStore(store.root).report(run) == before
     assert store.plan(run) == saved
 

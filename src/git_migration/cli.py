@@ -21,6 +21,7 @@ from git_migration.state import (
     RunnerTagRevisionBlocked,
     StateStore,
     atomic_json,
+    validate_ci_include_omissions,
     validate_runner_tag_changes,
 )
 from git_migration.steps.preflight import build_plan
@@ -185,6 +186,12 @@ def resume_command(
             help="Correct saved Git-copy job tags before any CI MR: OLD=NEW[,NEW]; repeat as needed"
         ),
     ] = None,
+    omit_ci_project_include: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Omit this literal project CI include in a review MR for a blocked Git-copy run; repeat as needed"
+        ),
+    ] = None,
 ) -> None:
     """Resume preparation using existing import identifiers and checkpoints."""
     if not source_frozen or not destination_isolated:
@@ -192,6 +199,12 @@ def resume_command(
         raise typer.Exit(2)
 
     def action() -> None:
+        if omit_ci_project_include:
+            validate_ci_include_omissions(omit_ci_project_include)
+            if runner_tag_map:
+                raise RunnerTagRevisionBlocked(
+                    "Correct runner tags and CI include omissions separately"
+                )
         changes: dict[str, list[str]] = {}
         for value in runner_tag_map or []:
             old, separator, targets = value.partition("=")
@@ -202,7 +215,10 @@ def resume_command(
             validate_runner_tag_changes(changes)
         store = StateStore(ctx.obj)
         migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
-        _finish(migrator.prepare(changes) if changes else migrator.prepare())
+        if omit_ci_project_include:
+            _finish(migrator.prepare(omit_ci_project_includes=omit_ci_project_include))
+        else:
+            _finish(migrator.prepare(changes) if changes else migrator.prepare())
 
     _guard(action)
 

@@ -407,6 +407,80 @@ def test_resume_passes_explicit_tag_corrections(tmp_path, monkeypatch):
     assert received == [{"old": ["approved", "linux"], "legacy": ["approved"]}]
 
 
+def test_resume_passes_explicit_include_omissions(tmp_path, monkeypatch):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare(self, *, omit_ci_project_includes):
+            received.append(omit_ci_project_includes)
+            return {"id": run, "status": "awaiting_verification"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "resume",
+            run,
+            "--source-frozen",
+            "--destination-isolated",
+            "--omit-ci-project-include",
+            "team/optional-review",
+            "--omit-ci-project-include",
+            "team/optional-docs",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == [["team/optional-review", "team/optional-docs"]]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["$DYNAMIC"],
+        ["team/../review"],
+        ["https://user:synthetic-sensitive-marker@example/team/review"],
+        ["team/review", "team/review"],
+        ["team/review", "--runner-tag-map", "old=new"],
+    ],
+)
+def test_invalid_include_omission_stops_before_state_or_provider_access(
+    tmp_path, monkeypatch, entries
+):
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Invalid omissions must stop first")
+    )
+    state = tmp_path / "state"
+    flags = (
+        entries
+        if "--runner-tag-map" in entries
+        else [part for entry in entries for part in ("--omit-ci-project-include", entry)]
+    )
+    if "--runner-tag-map" in entries:
+        flags = ["--omit-ci-project-include", *flags]
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "resume",
+            "synthetic-run",
+            "--source-frozen",
+            "--destination-isolated",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "synthetic-sensitive-marker" not in result.output
+    assert not state.exists()
+
+
 @pytest.mark.parametrize(
     "entries",
     [
