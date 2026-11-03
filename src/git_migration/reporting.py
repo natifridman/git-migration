@@ -40,6 +40,11 @@ def show_report(report: dict[str, Any]) -> None:
         if data.get("error"):
             typer.echo(f"    {data['error']}")
         for request in data.get("requests", []):
+            if request.get("omit_ci_project_includes"):
+                typer.echo(
+                    "    CI project includes approved for omission: "
+                    + ", ".join(request["omit_ci_project_includes"])
+                )
             if request.get("iid"):
                 typer.echo(f"    Review MR !{request['iid']} targeting {request['target_branch']}")
             for blocker in request.get("blockers", []):

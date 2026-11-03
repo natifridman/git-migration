@@ -14,12 +14,27 @@ from pathlib import Path
 from typing import Any
 
 from git_migration.compatibility import CompatibilityBlocked, validate_endpoint_refresh
-from git_migration.models import MigrationPlan
+from git_migration.models import MigrationPlan, Repository
 from git_migration.secrets import SafeError
 
 
 class RunnerTagRevisionBlocked(SafeError):
     pass
+
+
+class CIIncludeRevisionBlocked(SafeError):
+    pass
+
+
+def validate_ci_include_omissions(paths: list[str]) -> None:
+    try:
+        if not paths:
+            raise ValueError("Empty omission list")
+        Repository.validate_include_omissions(paths)
+    except ValueError:
+        raise CIIncludeRevisionBlocked(
+            "Use unique --omit-ci-project-include namespace/project entries without hosts or expressions"
+        ) from None
 
 
 def validate_runner_tag_changes(changes: dict[str, list[str]]) -> None:
@@ -218,6 +233,120 @@ class StateStore:
                 db.execute(
                     "UPDATE steps SET status='superseded',updated_at=? WHERE run_id=? AND resource=? AND name=?",
                     (now, run_id, resource, name),
+                )
+            db.execute(
+                "UPDATE runs SET plan=?,status='preparing' WHERE id=?",
+                (plan.model_dump_json(), run_id),
+            )
+            return plan
+
+    def revise_ci_include_omissions(
+        self, run_id: str, paths: list[str], expected_config_hash: str
+    ) -> MigrationPlan:
+        """Caller holds the lock; retain import identity and audit a pre-write omission."""
+        validate_ci_include_omissions(paths)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise CIIncludeRevisionBlocked("Unknown migration run")
+            plan = MigrationPlan.model_validate_json(run["plan"])
+            if (
+                plan.config_hash != expected_config_hash
+                or plan.config_hash != plan.config.fingerprint()
+            ):
+                raise CIIncludeRevisionBlocked(
+                    "Saved configuration changed; reload the run before retrying"
+                )
+            if (
+                run["status"] == "active"
+                or plan.pilot
+                or len(plan.config.repositories) != 1
+                or plan.config.repositories[0].strategy != "git_copy"
+            ):
+                raise CIIncludeRevisionBlocked(
+                    "CI include corrections require one inactive, non-pilot Git-copy repository"
+                )
+            repo = plan.config.repositories[0]
+            previous = repo.omit_ci_project_includes
+            revised = list(dict.fromkeys([*previous, *paths]))
+            if revised == previous:
+                # Keep the same actions and deterministic branch after an ambiguous write.
+                return plan
+            rows = db.execute(
+                "SELECT * FROM steps WHERE run_id=? AND resource=?", (run_id, repo.source_path)
+            ).fetchall()
+            steps = {row["name"]: {**dict(row), "data": json.loads(row["data"])} for row in rows}
+            if (
+                any(
+                    steps.get(name, {}).get("status") != "complete"
+                    for name in ("snapshot", "import", "baseline_verified")
+                )
+                or steps.get("runner_mrs", {}).get("status") != "blocked"
+            ):
+                raise CIIncludeRevisionBlocked(
+                    "CI include corrections require completed import/baseline and blocked include preparation"
+                )
+            requests = steps["runner_mrs"]["data"].get("requests", [])
+            refs = steps["snapshot"]["data"].get("snapshot", {}).get("refs", {})
+            mapping_blocker = "Project CI include requires an explicit destination mapping"
+            if (
+                not requests
+                or not any(mapping_blocker in item.get("blockers", []) for item in requests)
+                or any(
+                    item.get("changed") is not False
+                    or any(
+                        item.get(key) for key in ("iid", "branch", "source_branch", "commit_sha")
+                    )
+                    or not item.get("source_sha")
+                    or item["source_sha"] != refs.get(f"refs/heads/{item.get('target_branch')}")
+                    or not (
+                        item.get("status") == "unchanged"
+                        and not item.get("blockers")
+                        or item.get("status") == "blocked"
+                        and item.get("blockers") == [mapping_blocker]
+                    )
+                    for item in requests
+                )
+                or "error" in steps["runner_mrs"]["data"]
+                or "smoke" in steps
+                or "activation" in steps
+            ):
+                raise CIIncludeRevisionBlocked(
+                    "CI include corrections are allowed only for unmapped includes before CI writes, smoke or activation; retain existing evidence"
+                )
+            previous_hash = plan.config_hash
+            repo.omit_ci_project_includes = revised
+            plan.config_hash = plan.config.fingerprint()
+            superseded = {
+                name: steps[name]
+                for name in ("runner_mrs", "preparation", "verification")
+                if name in steps
+            }
+            audit = {
+                "previous_config_hash": previous_hash,
+                "config_hash": plan.config_hash,
+                "previous_omit_ci_project_includes": previous,
+                "omit_ci_project_includes": revised,
+                "superseded_steps": superseded,
+            }
+            revision = 1 + sum(name.startswith("ci_include_revision_") for name in steps)
+            now = utc_now()
+            db.execute(
+                "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    repo.source_path,
+                    f"ci_include_revision_{revision}",
+                    "complete",
+                    json.dumps(audit),
+                    now,
+                ),
+            )
+            for name in superseded:
+                db.execute(
+                    "UPDATE steps SET status='superseded',updated_at=? WHERE run_id=? AND resource=? AND name=?",
+                    (now, run_id, repo.source_path, name),
                 )
             db.execute(
                 "UPDATE runs SET plan=?,status='preparing' WHERE id=?",

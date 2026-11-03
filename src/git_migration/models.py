@@ -85,12 +85,20 @@ class Repository(Model):
     destination_path: str
     strategy: Literal["direct_transfer", "file_export", "git_copy"] = "direct_transfer"
     skip_merge_request_history: bool = False
+    omit_ci_project_includes: list[str] = Field(default_factory=list)
     ci_branches: list[str] = Field(default_factory=list)
     variable_overrides: dict[str, str] = Field(default_factory=dict)
     ci_variables: list[CIVariable] = Field(default_factory=list)
     schedule_activation_ids: list[int] = Field(default_factory=list)
 
     _paths = field_validator("source_path", "destination_path")(project_path)
+
+    @field_validator("omit_ci_project_includes")
+    @classmethod
+    def validate_include_omissions(cls, value: list[str]) -> list[str]:
+        if any(project_path(path) != path for path in value) or len(value) != len(set(value)):
+            raise ValueError("CI include omissions must be unique literal namespace/project paths")
+        return value
 
     @model_validator(mode="after")
     def validate_history_policy(self) -> Repository:
@@ -271,6 +279,8 @@ class MigrationConfig(Model):
                 repository.pop("ci_variables")
             if not repository["skip_merge_request_history"]:
                 repository.pop("skip_merge_request_history")
+            if not repository["omit_ci_project_includes"]:
+                repository.pop("omit_ci_project_includes")
         payload = json.dumps(data, sort_keys=True).encode()
         return hashlib.sha256(payload).hexdigest()
 

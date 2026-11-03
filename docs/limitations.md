@@ -71,6 +71,16 @@ With the default `variables.mode: preserve_scopes`, CI/CD variables are fetched 
 
 CI edits are conservative and reviewable. Runtime tag expressions, unsupported/dynamic includes, cross-instance includes, unresolved inheritance, external dependency mappings, and complex YAML may require a manual migration MR. For projects with CI jobs, source pipeline statuses are historical and cannot replace an approved destination runner smoke job. Running that job requires `--run-smoke --smoke-isolated`: IT must prevent other triggers and policy-injected jobs before temporary CI enablement. Protected-only runner fleets block because automatic protection of smoke branches is unsupported.
 
+`repositories[].omit_ci_project_includes` explicitly permits removal of matching
+literal project includes in review MRs, including in supported local CI files.
+It disables those included jobs/templates and does not resolve remaining
+inheritance or dependency errors. The saved-run
+`resume --omit-ci-project-include namespace/project` correction is limited to a
+single non-pilot Git-copy run blocked only on unmapped includes, with completed
+import/baseline and no CI write, smoke or activation attempt. It audits the saved
+configuration and retains superseded evidence; identical retries recover the
+same MR. See the [omission procedure](git-copy.md#omit-an-optional-project-ci-include-after-git-copy).
+
 The explicit `resume --runner-tag-map OLD=NEW` correction is limited to one
 non-pilot Git-copy repository with completed import/baseline and unchanged CI
 preparation, before any CI MR, smoke, or activation attempt. It cannot discard

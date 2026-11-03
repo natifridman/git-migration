@@ -70,6 +70,15 @@ Run `apply PLAN --source-frozen --destination-isolated`, retain its run ID, and 
 
 Preparation retains disabled destination CI while reconciling variables under the selected policy, runner configuration, and CI edits on migration branches with draft merge requests. Review supported edits to explicit runner tags and project includes. Dynamic includes, unresolved references, external forks, submodules, ambiguous inherited configuration, or unsupported syntax require manual review; do not approve activation while related blockers remain.
 
+For an optional `include: project:` dependency whose functionality should be
+disabled, use an explicit repository `omit_ci_project_includes` list. A completed
+single-repository Git-copy import blocked only by missing include mappings can
+use `resume --omit-ci-project-include namespace/project` under the
+[saved-run omission procedure](git-copy.md#omit-an-optional-project-ci-include-after-git-copy).
+It audits the configuration revision and prepares a draft MR, preserving the
+import. Review the loss of included jobs/templates before merging; ordinary CI
+lint, runner, smoke, verification and activation checks remain required.
+
 If a Git-copy destination returns HTTP 403 from CI APIs because the CI feature is
 disabled, use the explicit [quarantined CI API workflow](git-copy.md#ci-api-access-while-the-project-is-quarantined).
 `--ci-api-isolated` requires IT to exclude other operators, external triggers, and

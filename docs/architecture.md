@@ -51,6 +51,18 @@ fingerprint; true is included. No plan/checkpoint schema version change is neede
 Existing Git-copy journals without the field mean false; opted-in journals record
 true, and resume refuses a policy mismatch.
 
+The default empty repository `omit_ci_project_includes` is also excluded from
+fingerprints. Explicit lists are fingerprinted and permit reviewable removal of
+matching project CI includes. `resume --omit-ci-project-include` atomically revises
+only that list for a single non-pilot Git-copy run blocked before CI writes on
+unmapped includes. It requires completed snapshot/import/baseline evidence and
+no smoke or activation attempts, audits old/new hashes and superseded steps in
+`ci_include_revision_*`, and preserves import identities/journals. Existing
+pre-write blocked checkpoints need no conversion. Identical retries retain the
+same actions and deterministic branch; a different correction cannot discard
+an ambiguous write. Manifest/plan files remain unchanged. No schema change is
+required; lock-time configuration checks still reject stale commands.
+
 `resume --runner-tag-map` permits a scoped configuration revision only for a
 single non-pilot Git-copy run after baseline verification and unchanged runner
 preparation, before CI edits/MRs, smoke, or activation. Under the workspace lock,

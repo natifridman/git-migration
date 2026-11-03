@@ -138,7 +138,10 @@ def test_prepare_checkpoints_snapshot_and_resumes_without_duplicate_import(
     assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
 
 
-def test_runner_tag_correction_recovers_same_mr_and_still_requires_review(migration, monkeypatch):
+@pytest.mark.parametrize("correction", ["tags", "include"])
+def test_ci_correction_recovers_same_mr_and_still_requires_review(
+    migration, monkeypatch, correction
+):
     original, store, _, source, target, strategy = migration
     plan = original.plan.model_copy(deep=True)
     plan.config.repositories[0].strategy = "git_copy"
@@ -151,10 +154,21 @@ def test_runner_tag_correction_recovers_same_mr_and_still_requires_review(migrat
 
     def prepare_mr(destination, project_id, branch, tag_map, **kwargs):
         assert destination.builds_access_level == "disabled"
-        if not tag_map:
+        omissions = kwargs["omit_project_includes"]
+        if correction == "include" and not omissions:
+            return {
+                "status": "blocked",
+                "changed": False,
+                "jobs": jobs,
+                "blockers": ["Project CI include requires an explicit destination mapping"],
+            }
+        if correction == "tags" and not tag_map:
             return {"status": "unchanged", "changed": False, "jobs": jobs, "blockers": []}
-        assert tag_map == {"old-linux": ["approved"]}
-        attempts.append(dict(tag_map))
+        if correction == "tags":
+            assert tag_map == {"old-linux": ["approved"]}
+        else:
+            assert omissions == ["team/optional-review"] and not tag_map
+        attempts.append(True)
         if not remote_requests:
             remote_requests.append(
                 {
@@ -172,17 +186,24 @@ def test_runner_tag_correction_recovers_same_mr_and_still_requires_review(migrat
 
     monkeypatch.setattr(orchestrator, "prepare_runner_merge_request", prepare_mr)
     migrator = orchestrator.Migrator(store.plan(run), store, run, source, target)
-    assert migrator.prepare()["status"] == "awaiting_verification"
+    assert migrator.prepare()["status"] == (
+        "blocked" if correction == "include" else "awaiting_verification"
+    )
     stale = orchestrator.Migrator(store.plan(run), store, run, source, target)
     before_import = store.step(run, "team/repo", "import")
-    changes = {"old-linux": ["approved"]}
-    assert migrator.prepare(changes)["status"] == "blocked"
+
+    def resume(migrator):
+        if correction == "tags":
+            return migrator.prepare({"old-linux": ["approved"]})
+        return migrator.prepare(omit_ci_project_includes=["team/optional-review"])
+
+    assert resume(migrator)["status"] == "blocked"
     assert store.step(run, "team/repo", "runner_mrs")["status"] == "superseded"
     with pytest.raises(orchestrator.MigrationBlocked, match="Saved configuration changed"):
         stale.prepare()
     resumed = orchestrator.Migrator(store.plan(run), store, run, source, target)
-    assert resumed.prepare(changes)["status"] == "awaiting_verification"
-    assert attempts == [changes, changes]
+    assert resume(resumed)["status"] == "awaiting_verification"
+    assert attempts == [True, True]
     assert len(remote_requests) == 1
     assert strategy.starts == strategy.polls == 1
     assert store.step(run, "team/repo", "import") == before_import
@@ -202,7 +223,10 @@ def test_runner_tag_correction_recovers_same_mr_and_still_requires_review(migrat
 
 
 @pytest.mark.parametrize("record", ["smoke-journal-20.json", "smoke-owned-20-synthetic.json"])
-def test_tag_correction_recovers_but_refuses_uncheckpointed_smoke(migration, monkeypatch, record):
+@pytest.mark.parametrize("correction", ["tags", "include"])
+def test_ci_correction_recovers_but_refuses_uncheckpointed_smoke(
+    migration, monkeypatch, record, correction
+):
     original, store, _, source, target, strategy = migration
     plan = original.plan.model_copy(deep=True)
     plan.config.repositories[0].strategy = "git_copy"
@@ -232,10 +256,14 @@ def test_tag_correction_recovers_but_refuses_uncheckpointed_smoke(migration, mon
 
     monkeypatch.setattr(orchestrator.Migrator, "_recover_smokes", recovery)
     with pytest.raises(orchestrator.MigrationBlocked, match="smoke recovery or ownership"):
-        migrator.prepare({"old-linux": ["approved"]})
+        if correction == "tags":
+            migrator.prepare({"old-linux": ["approved"]})
+        else:
+            migrator.prepare(omit_ci_project_includes=["team/optional-review"])
     assert recovered == [True]
     assert store.plan(run) == plan
     assert store.step(run, "team/repo", "runner_tag_revision_1") is None
+    assert store.step(run, "team/repo", "ci_include_revision_1") is None
     assert strategy.starts == 1
 
 

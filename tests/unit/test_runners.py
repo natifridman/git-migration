@@ -230,6 +230,49 @@ def test_mapped_project_includes_require_and_use_merged_lint_jobs():
     assert result["jobs"] == [{"job": "job", "tags": ["approved"]}]
 
 
+@pytest.mark.parametrize(
+    "include",
+    [
+        "include:\n  project: team/optional-review\n  file: ci/review.yml\n",
+        "include:\n  - project: team/optional-review\n    file: ci/review.yml\n    rules:\n      - if: '$CI_MERGE_REQUEST_LABELS =~ /ai-review/'\n",
+    ],
+)
+def test_optional_project_include_is_removed_only_with_explicit_opt_in(include):
+    content = include + "job:\n  tags: [old]\n  script: echo ok\n"
+    assert transform_ci_yaml(content, {})["blockers"]
+    result = transform_ci_yaml(content, {}, omit_project_includes=["team/optional-review"])
+    assert result["changed"] and not result["blockers"]
+    assert _yaml().load(result["content"]) == _yaml().load(content[content.index("job:") :])
+    assert not transform_ci_yaml(
+        result["content"], {}, omit_project_includes=["team/optional-review"]
+    )["changed"]
+
+
+def test_omission_retains_other_includes_and_unmapped_dependency_gate():
+    content = "include:\n  - project: team/optional-review\n    file: ci/review.yml\n  - local: /ci/local.yml\n  - project: team/required\n    file: ci/build.yml\n"
+    result = transform_ci_yaml(content, {}, omit_project_includes=["team/optional-review"])
+    assert result["blockers"] == ["Project CI include requires an explicit destination mapping"]
+    assert _yaml().load(result["content"])["include"] == [
+        {"local": "/ci/local.yml"},
+        {"project": "team/required", "file": "ci/build.yml"},
+    ]
+
+
+def test_omission_creates_review_mr_without_altering_source_branch():
+    api = CIAPI()
+    original = "include:\n  - project: team/optional-review\n    file: ci/review.yml\njob:\n  tags: [old]\n  script: echo ok\n"
+    api.files["main"] = original
+    blocked = prepare_runner_merge_request(api, 1, "main", {})
+    assert blocked["status"] == "blocked" and not api.mrs and api.commits == 0
+    result = prepare_runner_merge_request(
+        api, 1, "main", {}, omit_project_includes=["team/optional-review"]
+    )
+    assert result["status"] == "created"
+    assert api.files["main"] == original
+    assert "include" not in _yaml().load(api.files[result["branch"]])
+    assert result["jobs"] == [{"job": "job", "tags": ["old"]}]
+
+
 def test_local_include_is_read_for_inherited_job_tags():
     from urllib.parse import unquote
 

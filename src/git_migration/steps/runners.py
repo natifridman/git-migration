@@ -183,21 +183,26 @@ _RESERVED = {
 }
 
 
-def transform_ci_yaml(content: Any, tag_map: Any, project_include_map: Any = None) -> Any:
-    """Edit explicit tag nodes only. Preserve round-trip anchors and custom !reference tags."""
+def transform_ci_yaml(
+    content: Any,
+    tag_map: Any,
+    project_include_map: Any = None,
+    omit_project_includes: Any = None,
+) -> Any:
+    """Edit explicit tags/includes, preserving round-trip anchors and custom tags."""
     parser = _yaml()
     try:
         doc = parser.load(content)
     except Exception:
         return {"content": content, "changed": False, "blockers": ["CI YAML could not be parsed"]}
-    if not isinstance(doc, Mapping):
+    if not isinstance(doc, MutableMapping):
         return {
             "content": content,
             "changed": False,
             "blockers": ["CI configuration must be a mapping"],
         }
     blockers, changed, seen = [], False, set()
-    nodes = [doc]
+    nodes: list[Mapping[Any, Any]] = [doc]
     if isinstance(doc.get("default"), Mapping):
         nodes.append(doc["default"])
     nodes.extend(v for k, v in doc.items() if k not in _RESERVED and isinstance(v, Mapping))
@@ -231,10 +236,16 @@ def transform_ci_yaml(content: Any, tag_map: Any, project_include_map: Any = Non
             changed = True
     includes = doc.get("include", [])
     includes = includes if isinstance(includes, list) else [includes]
+    retained = []
+    omitted = set()
     for inc in includes:
         if isinstance(inc, MutableMapping) and "project" in inc:
             project = inc["project"]
-            if project in (project_include_map or {}):
+            if isinstance(project, str) and project in (omit_project_includes or []):
+                omitted.add(project)
+                changed = True
+                continue
+            if isinstance(project, str) and project in (project_include_map or {}):
                 if inc["project"] != project_include_map[project]:
                     inc["project"] = project_include_map[project]
                     changed = True
@@ -244,6 +255,16 @@ def transform_ci_yaml(content: Any, tag_map: Any, project_include_map: Any = Non
             isinstance(inc, str) and inc.startswith("/")
         ):
             blockers.append("External, component or dynamic CI include requires manual review")
+        retained.append(inc)
+    if omitted:
+        if retained:
+            # Keep sequence comments and the original scalar/mapping shape when possible.
+            if isinstance(doc["include"], list):
+                doc["include"][:] = retained
+            else:
+                doc["include"] = retained[0]
+        else:
+            del doc["include"]
     output = io.StringIO()
     parser.dump(doc, output)
     return {
@@ -369,6 +390,7 @@ def prepare_runner_merge_request(
     tag_map: Any,
     ci_path: Any = ".gitlab-ci.yml",
     project_include_map: Any = None,
+    omit_project_includes: Any = None,
 ) -> Any:
     """Prepare a deterministic branch/MR with builds disabled. Never run or merge source CI."""
     path = _p(project_id)
@@ -414,7 +436,7 @@ def prepare_runner_merge_request(
             return
         visiting.add(name)
         content = _read_file(destination, path, name, source_sha)
-        result = transform_ci_yaml(content, tag_map, project_include_map)
+        result = transform_ci_yaml(content, tag_map, project_include_map, omit_project_includes)
         originals[name], edited[name] = content, result["content"]
         blockers.extend(result["blockers"])
         try:
@@ -533,7 +555,7 @@ def prepare_runner_merge_request(
             path + "/repository/commits",
             {
                 "branch": branch,
-                "commit_message": "Prepare destination runner tags [skip ci]",
+                "commit_message": "Prepare destination CI configuration [skip ci]",
                 "actions": branch_actions,
             },
         )
@@ -556,8 +578,8 @@ def prepare_runner_merge_request(
         {
             "source_branch": branch,
             "target_branch": ref,
-            "title": "Draft: Prepare destination CI runner tags",
-            "description": "Review runner eligibility and dependencies before enabling CI. Merge only after explicit approval.",
+            "title": "Draft: Prepare destination CI configuration",
+            "description": "Review runner tags, include edits and explicitly requested include omissions before enabling CI. Merge only after explicit approval.",
             "remove_source_branch": False,
         },
     )

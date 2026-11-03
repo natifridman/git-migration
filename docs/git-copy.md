@@ -131,6 +131,51 @@ with any required CI API attestation. Do not restart `apply`, hand-edit SQLite,
 or enable CI to work around the blocker. Other runner eligibility restrictions
 and smoke checks still apply after the tag correction.
 
+### Omit an optional project CI include after Git copy
+
+`Project CI include requires an explicit destination mapping` means a literal
+`include: project:` dependency is absent from the plan's repository mappings.
+That project must supply the referenced file on the destination GitLab, even if
+the source include has rules. Review the dependency and its destination first.
+
+If the dependency is optional and its functionality should be disabled, an
+existing single-repository Git-copy run blocked only by unmapped project includes
+can record an explicit omission and prepare a review MR:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated \
+  --omit-ci-project-include source/shared/optional-review
+```
+
+Repeat the option for additional literal project paths. Matching project include
+entries are removed from the root CI file and supported local includes; remaining
+includes, job definitions and scripts are retained. Jobs or templates supplied by
+the removed include are lost. References to those templates still block unless
+the remaining destination CI configuration resolves them. Destination CI Lint,
+runner eligibility, review, smoke verification and activation gates still apply.
+No source files are changed. Add `--ci-api-isolated` only when the guarded CI API
+workflow below is required and its isolation conditions are satisfied.
+
+The correction requires complete snapshot/import/baseline checkpoints, a blocked
+unmapped-include checkpoint with no CI writes, and no smoke or activation attempt.
+Native strategies, pilots, multiple repositories, other blockers, CI branches/MRs
+already created, and uncertain writes are refused. Keep the same run ID and state
+directory. Identical repeated corrections resume the same deterministic MR after
+interruption; a different correction cannot discard uncertain recovery evidence.
+Runner-tag and include corrections must be submitted separately.
+
+The saved run adds `repositories[].omit_ci_project_includes` and records the
+previous/new configuration hashes, omission lists and superseded checkpoints in
+`ci_include_revision_*`, atomically. The imported project ID, snapshot and import
+journal are retained. Existing checkpoints without an omission list remain
+eligible when their pre-write evidence satisfies these conditions. The original
+plan JSON and manifest are unchanged. For future plans, add the approved paths to
+the repository's `omit_ci_project_includes` list in the manifest before planning.
+The default empty list preserves existing fingerprints and requires no format
+conversion. Review and merge the generated draft MR while CI remains quarantined,
+then verify with the required isolated smoke job before activation.
+
 ### CI inventories with CI disabled
 
 GitLab can return HTTP 403 for pipeline schedules while project CI is disabled.
