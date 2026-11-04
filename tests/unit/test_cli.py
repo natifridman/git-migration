@@ -7,6 +7,8 @@ from typing import Any
 import gitlab
 import pytest
 import requests
+from rich.text import Text
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from git_migration import __version__, cli
@@ -513,7 +515,13 @@ def test_resume_passes_explicit_saved_runner_mr_amendment(
         ],
     ],
 )
-def test_invalid_runner_mr_amendment_stops_before_state_and_providers(tmp_path, monkeypatch, flags):
+@pytest.mark.parametrize("color", [False, True], ids=["plain", "color"])
+def test_invalid_runner_mr_amendment_stops_before_state_and_providers(
+    tmp_path, monkeypatch, flags, color
+):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", color)
+    monkeypatch.setattr(rich_utils, "COLOR_SYSTEM", "standard" if color else None)
     monkeypatch.setattr(
         cli, "Migrator", lambda *args, **kwargs: pytest.fail("Invalid amendment must stop first")
     )
@@ -531,7 +539,7 @@ def test_invalid_runner_mr_amendment_stops_before_state_and_providers(tmp_path, 
         ],
     )
     assert result.exit_code == 2
-    assert "amend-runner-mr" in result.output
+    assert "amend-runner-mr" in Text.from_ansi(result.output).plain
     assert not state.exists()
 
 
