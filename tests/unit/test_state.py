@@ -13,6 +13,7 @@ from git_migration.compatibility import CompatibilityBlocked
 from git_migration.models import MigrationConfig, MigrationPlan
 from git_migration.state import (
     CIIncludeRevisionBlocked,
+    RunnerMRAmendmentBlocked,
     RunnerTagRevisionBlocked,
     StateStore,
     atomic_json,
@@ -153,7 +154,10 @@ def tag_revision_run(tmp_path):
                         "changed": False,
                         "source_sha": "a" * 40,
                         "target_branch": "main",
-                        "jobs": [{"job": "check", "tags": ["old-linux"]}],
+                        "jobs": [
+                            {"job": "check", "tags": ["old-linux"]},
+                            {"job": "untagged", "tags": []},
+                        ],
                         "blockers": [],
                     }
                 ]
@@ -165,6 +169,256 @@ def tag_revision_run(tmp_path):
     store.save(run, "team/repo", "verification", "blocked", {"blockers": ["No runner"]})
     store.set_status(run, "blocked")
     return store, run, saved
+
+
+@pytest.fixture
+def amendment_run(tag_revision_run):
+    store, run, saved = tag_revision_run
+    request = store.step(run, "team/repo", "runner_mrs")["data"]["requests"][0]
+    request.update(
+        status="created",
+        changed=True,
+        iid=21,
+        branch="codex/runner-migration-synthetic",
+        source_branch="codex/runner-migration-synthetic",
+        commit_sha="b" * 40,
+    )
+    store.save(run, "team/repo", "runner_mrs", "complete", {"requests": [request]})
+    store.save(run, "team/repo", "preparation", "complete", {"awaiting_review": True})
+    proposal = {
+        "operation_id": "e" * 64,
+        "project_id": 20,
+        "prepared": request,
+        "default_tags": ["approved"],
+        "ci_path": ".gitlab-ci.yml",
+        "root_before_sha256": "a" * 64,
+        "root_after_sha256": "b" * 64,
+        "root_last_commit_id": "b" * 40,
+        "default_tag_metadata": {
+            "inserted": True,
+            "reason": "Added requested default tags",
+            "affected_jobs": ["untagged"],
+            "merged_ci_sha256": "c" * 64,
+        },
+        "jobs": [{"job": "untagged", "tags": ["approved"]}],
+    }
+    return store, run, saved, proposal
+
+
+def amended_request(proposal):
+    return {
+        **proposal["prepared"],
+        "status": "amended",
+        "changed": True,
+        "commit_sha": "c" * 40,
+        "jobs": proposal["jobs"],
+        "default_tags": proposal["default_tag_metadata"],
+    }
+
+
+def test_runner_mr_amendment_intent_and_finish_are_atomic_and_audited(amendment_run):
+    store, run, saved, proposal = amendment_run
+    original = store.report(run)
+    context = store.validate_runner_mr_amendment(run, 21, ["approved"], saved.config_hash)
+    assert context["status"] == "new" and store.report(run) == original
+    intent = store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)
+    assert store.plan(run) == saved
+    assert store.step(run, "team/repo", "runner_mrs") == context["steps"]["runner_mrs"]
+    assert intent["status"] == "preparing"
+    assert intent["data"]["previous_config_hash"] == saved.config_hash
+    assert intent["data"]["previous_default_tags"] == []
+    assert intent["data"]["original_request"] == proposal["prepared"]
+    before_retry = store.report(run)
+    assert (
+        store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)
+        == intent
+    )
+    assert store.report(run) == before_retry
+    with pytest.raises(RunnerMRAmendmentBlocked, match="--amend-runner-mr 21"):
+        store.validate_runner_mr_amendment(run, 21, ["different"], saved.config_hash)
+    updated = amended_request(proposal)
+    revised = store.finish_runner_mr_amendment(run, intent["name"], updated, saved.config_hash)
+    assert revised.config.runners.default_tags == ["approved"]
+    assert revised.config_hash == revised.config.fingerprint() != saved.config_hash
+    assert revised.endpoint_snapshot == saved.endpoint_snapshot
+    assert store.step(run, "team/repo", "runner_mrs")["data"] == {"requests": [updated]}
+    for name in ("snapshot", "import", "baseline_verified"):
+        assert store.step(run, "team/repo", name) == context["steps"][name]
+    for name in ("preparation", "verification"):
+        assert store.step(run, "team/repo", name)["status"] == "superseded"
+    audit = store.step(run, "team/repo", intent["name"])
+    assert audit["status"] == "complete" and audit["data"]["updated_request"] == updated
+    assert audit["data"]["superseded_steps"]["runner_mrs"] == context["steps"]["runner_mrs"]
+    assert store.pending_runner_amendment(run) is None
+    before_retry = store.report(run)
+    assert (
+        store.validate_runner_mr_amendment(run, 21, ["approved"], revised.config_hash)["status"]
+        == "complete"
+    )
+    assert (
+        store.finish_runner_mr_amendment(run, intent["name"], updated, revised.config_hash)
+        == revised
+    )
+    assert store.report(run) == before_retry
+
+
+def test_runner_mr_amendment_normalizes_custom_ci_path(amendment_run):
+    store, run, saved, proposal = amendment_run
+    snapshot = store.step(run, "team/repo", "snapshot")["data"]
+    snapshot["ci_config_path"] = "/ci/root.yml"
+    store.save(run, "team/repo", "snapshot", "complete", snapshot)
+    proposal["ci_path"] = "ci/root.yml"
+    assert (
+        store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)[
+            "status"
+        ]
+        == "preparing"
+    )
+
+
+def test_runner_mr_amendment_recovery_flags_quote_literal_tags():
+    import shlex
+
+    message = StateStore.runner_amendment_recovery_message(
+        {"data": {"iid": 21, "default_tags": ["linux;echo-danger", "linux`command`"]}}
+    )
+    assert "--default-runner-tag 'linux;echo-danger'" in message
+    assert "--default-runner-tag 'linux`command`'" in message
+    assert "linux;echo-danger" in shlex.split(message)
+
+
+@pytest.mark.parametrize("stage", ["begin", "finish"])
+def test_runner_mr_amendment_rolls_back_on_transaction_failure(amendment_run, stage):
+    store, run, saved, proposal = amendment_run
+    if stage == "finish":
+        intent = store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)
+    before = store.report(run)
+    with store.connection() as db:
+        db.execute("""CREATE TRIGGER fail_amendment BEFORE UPDATE ON runs
+                      BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError):
+        if stage == "begin":
+            store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)
+        else:
+            store.finish_runner_mr_amendment(
+                run, intent["name"], amended_request(proposal), saved.config_hash
+            )
+    assert store.plan(run) == saved
+    assert store.report(run) == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "raw_content",
+        "changed_proposal",
+        "stale_hash",
+        "wrong_iid",
+        "no_tags",
+        "active",
+        "pilot",
+        "native",
+        "incomplete",
+        "error",
+        "smoke",
+        "activation",
+        "multiple_requests",
+        "branch",
+        "baseline",
+        "commit",
+        "smoke_journal",
+    ],
+)
+def test_runner_mr_amendment_rejects_unsafe_intents_without_writes(amendment_run, fault):
+    store, run, saved, proposal = amendment_run
+    iid, tags, expected_hash = 21, ["approved"], saved.config_hash
+    if fault == "raw_content":
+        proposal["content"] = "synthetic-private-ci"
+    elif fault == "changed_proposal":
+        proposal["prepared"] = {**proposal["prepared"], "iid": 99}
+    elif fault == "stale_hash":
+        expected_hash = "stale"
+    elif fault == "wrong_iid":
+        iid = 99
+    elif fault == "no_tags":
+        tags = []
+    elif fault == "active":
+        store.set_status(run, "active")
+    elif fault in {"pilot", "native"}:
+        saved.pilot = fault == "pilot"
+        if fault == "native":
+            saved.config.repositories[0].strategy = "direct_transfer"
+        saved.config_hash = expected_hash = saved.config.fingerprint()
+        with store.connection() as db:
+            db.execute("UPDATE runs SET plan=? WHERE id=?", (saved.model_dump_json(), run))
+    elif fault == "incomplete":
+        store.save(run, "team/repo", "preparation", "failed", {"error": "ambiguous write"})
+    elif fault in {"smoke", "activation"}:
+        store.save(run, "team/repo", fault, "failed", {"operation": "retain"})
+    elif fault in {"multiple_requests", "branch", "baseline", "commit", "error"}:
+        data = store.step(run, "team/repo", "runner_mrs")["data"]
+        request = data["requests"][0]
+        if fault == "multiple_requests":
+            data["requests"].append(dict(request))
+        elif fault == "branch":
+            request["source_branch"] = "unowned-branch"
+        elif fault == "baseline":
+            request["source_sha"] = "f" * 40
+        elif fault == "commit":
+            request["commit_sha"] = "unknown"
+        else:
+            request["error"] = "ambiguous write"
+        store.save(run, "team/repo", "runner_mrs", "complete", data)
+    before, old_plan = store.report(run), store.plan(run)
+    with pytest.raises((RunnerMRAmendmentBlocked, RunnerTagRevisionBlocked)):
+        store.begin_runner_mr_amendment(
+            run, iid, tags, expected_hash, proposal, smoke_attempted=fault == "smoke_journal"
+        )
+    assert store.report(run) == before and store.plan(run) == old_plan
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "identity",
+        "job_evidence",
+        "import_evidence",
+        "preparation_evidence",
+        "verification_evidence",
+        "runner_evidence",
+        "smoke",
+        "activation",
+        "smoke_journal",
+    ],
+)
+def test_pending_runner_mr_amendment_retains_intent_on_unattributed_finish(amendment_run, fault):
+    store, run, saved, proposal = amendment_run
+    intent = store.begin_runner_mr_amendment(run, 21, ["approved"], saved.config_hash, proposal)
+    updated = amended_request(proposal)
+    if fault == "identity":
+        updated["iid"] = 99
+    elif fault == "job_evidence":
+        updated["jobs"] = []
+    elif fault == "import_evidence":
+        store.save(run, "team/repo", "import", "complete", {"destination_id": 99})
+    elif fault in {"preparation_evidence", "verification_evidence", "runner_evidence"}:
+        name = {
+            "preparation_evidence": "preparation",
+            "verification_evidence": "verification",
+            "runner_evidence": "runner_mrs",
+        }[fault]
+        store.save(run, "team/repo", name, "failed", {"error": "changed evidence"})
+    elif fault in {"smoke", "activation"}:
+        store.save(run, "team/repo", fault, "failed", {"operation": "retain"})
+    before = store.report(run)
+    with pytest.raises(RunnerMRAmendmentBlocked):
+        if fault == "smoke_journal":
+            store.validate_runner_mr_amendment(
+                run, 21, ["approved"], saved.config_hash, smoke_attempted=True
+            )
+        else:
+            store.finish_runner_mr_amendment(run, intent["name"], updated, saved.config_hash)
+    assert store.report(run) == before and store.plan(run) == saved
 
 
 def test_runner_tag_revision_is_audited_atomic_and_keeps_import_identity(tag_revision_run):
@@ -188,19 +442,28 @@ def test_runner_tag_revision_is_audited_atomic_and_keeps_import_identity(tag_rev
     assert audit["config_hash"] == updated.config_hash
     assert audit["previous_tag_map"] == {}
     assert audit["tag_map"] == {"old-linux": ["approved"]}
+    assert audit["previous_default_tags"] == audit["default_tags"] == []
     assert audit["superseded_steps"] == {
         name: before[name] for name in ("runner_mrs", "preparation", "verification")
     }
     assert reopened.report(run)["status"] == "preparing"
 
 
-def test_same_correction_resumes_after_mr_attempt_but_different_one_is_refused(tag_revision_run):
+@pytest.mark.parametrize("default_tags", [None, ["approved"]])
+def test_same_correction_resumes_after_mr_attempt_but_different_one_is_refused(
+    tag_revision_run, default_tags
+):
     store, run, original = tag_revision_run
-    updated = store.revise_runner_tags(run, {"old-linux": ["approved"]}, original.config_hash)
+    updated = store.revise_runner_tags(
+        run, {"old-linux": ["approved"]}, original.config_hash, default_tags=default_tags
+    )
     # A crash during remote MR creation leaves the old checkpoint superseded.
     before = store.report(run)
     assert (
-        store.revise_runner_tags(run, {"old-linux": ["approved"]}, updated.config_hash) == updated
+        store.revise_runner_tags(
+            run, {"old-linux": ["approved"]}, updated.config_hash, default_tags=default_tags
+        )
+        == updated
     )
     assert store.report(run) == before
     with pytest.raises(RunnerTagRevisionBlocked):
@@ -209,13 +472,112 @@ def test_same_correction_resumes_after_mr_attempt_but_different_one_is_refused(t
     store.save(run, "team/repo", "runner_mrs", "complete", {"requests": [{"iid": 2}]})
     before = store.report(run)
     assert (
-        store.revise_runner_tags(run, {"old-linux": ["approved"]}, updated.config_hash) == updated
+        store.revise_runner_tags(
+            run, {"old-linux": ["approved"]}, updated.config_hash, default_tags=default_tags
+        )
+        == updated
     )
     with pytest.raises(RunnerTagRevisionBlocked):
         store.revise_runner_tags(run, {"old-linux": ["different"]}, updated.config_hash)
     assert store.report(run) == before
 
 
+@pytest.mark.parametrize("changes", [{}, {"old-linux": ["mapped"]}])
+def test_default_tag_correction_is_atomic_audited_and_retains_imports(tag_revision_run, changes):
+    store, run, original = tag_revision_run
+    before = {step["name"]: step for step in store.report(run)["steps"]}
+    updated = store.revise_runner_tags(
+        run, changes, original.config_hash, default_tags=["approved", "linux"]
+    )
+    assert updated.config.runners.default_tags == ["approved", "linux"]
+    assert updated.config.runners.tag_map == changes
+    assert updated.config.runners.allowed_runner_ids == original.config.runners.allowed_runner_ids
+    assert updated.config_hash == updated.config.fingerprint() != original.config_hash
+    assert StateStore(store.root).plan(run) == updated
+    for name in ("snapshot", "import", "baseline_verified"):
+        assert store.step(run, "team/repo", name) == before[name]
+    audit = store.step(run, "team/repo", "runner_tag_revision_1")["data"]
+    assert audit["previous_default_tags"] == []
+    assert audit["default_tags"] == ["approved", "linux"]
+    assert audit["previous_tag_map"] == {}
+    assert audit["tag_map"] == changes
+    assert audit["previous_config_hash"] == original.config_hash
+    assert audit["config_hash"] == updated.config_hash
+    assert audit["superseded_steps"] == {
+        name: before[name] for name in ("runner_mrs", "preparation", "verification")
+    }
+    before_retry = store.report(run)
+    assert (
+        store.revise_runner_tags(
+            run, changes, updated.config_hash, default_tags=["approved", "linux"]
+        )
+        == updated
+    )
+    assert store.report(run) == before_retry
+    with pytest.raises(RunnerTagRevisionBlocked):
+        store.revise_runner_tags(run, {}, updated.config_hash, default_tags=["different"])
+    assert store.report(run) == before_retry
+
+
+@pytest.mark.parametrize("default_tags", [None, ["replacement"]])
+def test_default_tag_correction_replaces_and_omission_preserves_saved_defaults(
+    tag_revision_run, default_tags
+):
+    store, run, saved = tag_revision_run
+    saved.config.runners.default_tags = ["previous"]
+    saved.config_hash = saved.config.fingerprint()
+    with store.connection() as db:
+        db.execute("UPDATE runs SET plan=? WHERE id=?", (saved.model_dump_json(), run))
+    updated = store.revise_runner_tags(
+        run, {"old-linux": ["mapped"]}, saved.config_hash, default_tags=default_tags
+    )
+    assert updated.config.runners.default_tags == (
+        ["previous"] if default_tags is None else ["replacement"]
+    )
+    audit = store.step(run, "team/repo", "runner_tag_revision_1")["data"]
+    assert audit["previous_default_tags"] == ["previous"]
+    assert audit["default_tags"] == updated.config.runners.default_tags
+    # Identical map retry preserves the configured defaults without a second audit.
+    before = store.report(run)
+    assert store.revise_runner_tags(run, {"old-linux": ["mapped"]}, updated.config_hash) == updated
+    assert store.report(run) == before
+
+
+@pytest.mark.parametrize(
+    "jobs", [[{"job": "tagged", "tags": ["old-linux"]}], [{"job": "unknown"}], []]
+)
+def test_default_tag_correction_requires_a_saved_untagged_job(tag_revision_run, jobs):
+    store, run, saved = tag_revision_run
+    data = store.step(run, "team/repo", "runner_mrs")["data"]
+    data["requests"][0]["jobs"] = jobs
+    store.save(run, "team/repo", "runner_mrs", "complete", data)
+    before = store.report(run)
+    with pytest.raises(RunnerTagRevisionBlocked, match="untagged job"):
+        store.revise_runner_tags(run, {}, saved.config_hash, default_tags=["approved"])
+    assert store.plan(run) == saved
+    assert store.report(run) == before
+
+
+@pytest.mark.parametrize(
+    "default_tags",
+    [
+        [""],
+        ["$DYNAMIC"],
+        ["two words"],
+        ["same", "same"],
+        [f"tag-{number}" for number in range(50)],
+    ],
+)
+def test_default_tag_correction_rejects_invalid_values_atomically(tag_revision_run, default_tags):
+    store, run, saved = tag_revision_run
+    before = store.report(run)
+    with pytest.raises(RunnerTagRevisionBlocked):
+        store.revise_runner_tags(run, {}, saved.config_hash, default_tags=default_tags)
+    assert store.plan(run) == saved
+    assert store.report(run) == before
+
+
+@pytest.mark.parametrize("default_tags", [None, ["approved"]])
 @pytest.mark.parametrize(
     "fault",
     [
@@ -226,11 +588,22 @@ def test_same_correction_resumes_after_mr_attempt_but_different_one_is_refused(t
         "stale_hash",
         "bad_fingerprint",
         "incomplete_import",
+        "missing_preparation",
+        "pending_preparation",
+        "failed_preparation",
+        "preparation_error",
+        "preparation_review",
         "pending_mr",
         "existing_mr",
         "changed_ci",
+        "ci_branch",
+        "ci_commit",
+        "ci_error",
+        "request_error",
+        "unknown_change",
         "no_ci",
         "smoke",
+        "smoke_recovery",
         "activation",
         "unknown_tag",
         "dynamic_tag",
@@ -238,7 +611,9 @@ def test_same_correction_resumes_after_mr_attempt_but_different_one_is_refused(t
         "duplicate_tag",
     ],
 )
-def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(tag_revision_run, fault):
+def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(
+    tag_revision_run, fault, default_tags
+):
     store, run, saved = tag_revision_run
     changes = {"old-linux": ["approved"]}
     if fault == "active":
@@ -263,7 +638,40 @@ def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(tag_revision_run
         saved.config_hash = "stale"
     elif fault == "incomplete_import":
         store.save(run, "team/repo", "import", "writing", {"handle": "keep-me"})
-    elif fault in {"pending_mr", "existing_mr", "changed_ci", "no_ci"}:
+    elif fault == "missing_preparation":
+        with store.connection() as db:
+            db.execute(
+                "DELETE FROM steps WHERE run_id=? AND resource=? AND name='preparation'",
+                (run, "team/repo"),
+            )
+    elif fault in {
+        "pending_preparation",
+        "failed_preparation",
+        "preparation_error",
+        "preparation_review",
+    }:
+        store.save(
+            run,
+            "team/repo",
+            "preparation",
+            {"pending_preparation": "preparing", "failed_preparation": "failed"}.get(
+                fault, "complete"
+            ),
+            {"awaiting_review": True}
+            if fault == "preparation_review"
+            else {"error": "Ambiguous CI write"},
+        )
+    elif fault in {
+        "pending_mr",
+        "existing_mr",
+        "changed_ci",
+        "no_ci",
+        "ci_branch",
+        "ci_commit",
+        "ci_error",
+        "request_error",
+        "unknown_change",
+    }:
         step = store.step(run, "team/repo", "runner_mrs")
         request = step["data"]["requests"][0]
         if fault == "existing_mr":
@@ -272,6 +680,16 @@ def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(tag_revision_run
             request["changed"] = True
         if fault == "no_ci":
             request["status"] = "no_ci"
+        if fault == "ci_branch":
+            request["source_branch"] = "migration-write"
+        if fault == "ci_commit":
+            request["commit_sha"] = "b" * 40
+        if fault == "ci_error":
+            step["data"]["error"] = "Ambiguous write"
+        if fault == "request_error":
+            request["error"] = "Ambiguous write"
+        if fault == "unknown_change":
+            request.pop("changed")
         store.save(
             run,
             "team/repo",
@@ -279,7 +697,7 @@ def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(tag_revision_run
             "preparing" if fault == "pending_mr" else "complete",
             step["data"],
         )
-    elif fault in {"smoke", "activation"}:
+    elif fault in {"smoke", "smoke_recovery", "activation"}:
         store.save(run, "team/repo", fault, "failed", {"operation": "keep-me"})
     elif fault == "unknown_tag":
         changes = {"unknown": ["approved"]}
@@ -291,19 +709,22 @@ def test_runner_tag_revision_refuses_unsafe_or_ambiguous_states(tag_revision_run
         changes = {"old-linux": ["approved", "approved"]}
     before, before_plan = store.report(run), store.plan(run)
     with pytest.raises(RunnerTagRevisionBlocked):
-        store.revise_runner_tags(run, changes, saved.config_hash)
+        store.revise_runner_tags(run, changes, saved.config_hash, default_tags=default_tags)
     assert store.report(run) == before
     assert store.plan(run) == before_plan
 
 
-def test_runner_tag_revision_rolls_back_audit_and_invalidations_on_write_failure(tag_revision_run):
+@pytest.mark.parametrize("changes", [{}, {"old-linux": ["approved"]}])
+def test_runner_tag_revision_rolls_back_audit_and_invalidations_on_write_failure(
+    tag_revision_run, changes
+):
     store, run, saved = tag_revision_run
     before = store.report(run)
     with store.connection() as db:
         db.execute("""CREATE TRIGGER fail_revision BEFORE UPDATE OF plan ON runs
                       BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END""")
     with pytest.raises(sqlite3.IntegrityError):
-        store.revise_runner_tags(run, {"old-linux": ["approved"]}, saved.config_hash)
+        store.revise_runner_tags(run, changes, saved.config_hash, default_tags=["approved"])
     assert StateStore(store.root).report(run) == before
     assert store.plan(run) == saved
 

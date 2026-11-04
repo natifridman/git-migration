@@ -91,6 +91,37 @@ require review. A repository with no CI file, no custom CI path, and disabled Au
 DevOps needs no tag edit or smoke job; it stays without CI after activation.
 Selecting a runner tag alone does not create a pipeline or add job tags.
 
+To supply destination tags to jobs that use defaults, separately opt in with
+`runners.default_tags: [it-approved-linux]`. An omitted or empty list disables
+this feature. Supply at most 49 unique, nonempty literal tags, without
+whitespace, `$`, `=`, or commas. `runners.tags` remains the runner selector;
+`default_tags` does not change runner configuration or the approved runner IDs.
+Every effective job still needs a runner matching its complete tag set and
+protected-ref requirements.
+
+Preparation first applies `tag_map`, then adds root `default.tags` only when no
+effective `default.tags` declaration exists and at least one job lacks tags and
+accepts tag defaults. Other existing `default` keys are retained. Defaults from
+includes, including `default.tags: []`, are preserved. Explicit tags (including
+job `tags: []`), tags inherited through templates/`extends`, and
+`inherit:default` false or allowlists remain authoritative. Effective local and
+included configuration must be resolved reliably; unsupported/dynamic syntax or
+project includes without reliable merged CI Lint evidence block preparation.
+When project includes require merged lint and local included files also change,
+lint at the source commit cannot describe the prepared tree; this combination
+blocks for manual review rather than guessing the effective defaults.
+The option does not expand supported downstream/child-pipeline configuration.
+It creates no CI file or smoke requirement for a verified `no_ci` project.
+
+Changes use the existing deterministic migration branch and draft MR workflow.
+For project includes, preparation records `default_tags.merged_ci_sha256` and
+pins that merged configuration in the migration commit. Later include drift
+blocks retry or verification for reconciliation, even when proposed file edits
+are identical; it cannot create a replacement migration branch silently.
+Review the diff while destination CI stays quarantined, then merge and verify
+with the required isolated smoke test. Setting defaults does not authorize
+execution or waive verification and activation checks.
+
 ### Correct a missing tag mapping after Git copy
 
 If verification reports that no approved runner can execute a job, check the
@@ -98,8 +129,8 @@ reported job name, tags, and protected-ref requirement. Selecting `runners.tags`
 does not rewrite a job's existing tags. Confirm that the job is intended for the
 selected fleet before changing its tag mapping.
 
-For an existing single-repository Git-copy run whose CI preparation was entirely
-`unchanged` (no CI edits or MRs), use this explicit correction:
+For an existing single-repository Git-copy run with completed overall preparation
+and entirely `unchanged` CI preparation (no CI edits or MRs), use this correction:
 
 ```sh
 uv run --locked git-migrate resume RUN_ID \
@@ -112,14 +143,14 @@ Repeat `--runner-tag-map` for different source tags; use `OLD=NEW,NEW` for multi
 destination tags. Only literal tags present in the saved CI job inventory can be
 corrected. The correction adds or replaces those entries in the saved run's
 `runners.tag_map`, retains all other policies and approved runner IDs, and records
-the old/new maps and configuration fingerprints with the superseded checkpoints
+the old/new maps, default-tag lists, and configuration fingerprints with the superseded checkpoints
 in `runner_tag_revision_*`. The original plan JSON and manifest are not edited.
 Update the manifest separately for future plans.
 
-This requires completed snapshot/import/baseline checks and completed unchanged
-runner preparation, with no smoke or activation attempt. Native strategies,
+This requires completed snapshot/import/baseline checks, completed overall
+preparation, and unchanged runner preparation, with no smoke or activation attempt. Native strategies,
 pilots, multi-repository runs, incomplete preparation, and existing or uncertain
-CI edits/MRs are refused. An identical repeated correction is a no-op on saved
+CI writes/MRs are refused. An identical repeated correction is a no-op on saved
 configuration and resumes its original preparation; it does not discard recovery
 evidence. Keep the same run ID and private state directory.
 
@@ -130,6 +161,105 @@ needed). Only after verification succeeds, use `activate RUN_ID --source-frozen`
 with any required CI API attestation. Do not restart `apply`, hand-edit SQLite,
 or enable CI to work around the blocker. Other runner eligibility restrictions
 and smoke checks still apply after the tag correction.
+
+### Add destination default tags after Git copy
+
+For an existing untagged job intended to use destination tag defaults, use the
+explicit saved-run correction below after checking the approved runner fleet:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated \
+  --default-runner-tag it-approved-linux
+```
+
+Repeat `--default-runner-tag TAG` for each desired tag. The supplied list replaces
+the saved run's `runners.default_tags`; it does not select or modify runners.
+The same literal-tag and 49-tag limit applies. At least one job in the saved CI
+inventory must be untagged, but insertion can still be a no-op if existing
+defaults, explicit `tags: []`, or inheritance opt-outs prevent it. The option
+never overwrites an existing effective default or adds a CI file.
+
+This requires an inactive, non-pilot, single-repository Git-copy run, completed
+snapshot/import/baseline checkpoints, completed overall preparation, and unchanged
+runner preparation without errors or pending review.
+Any previous CI write/MR, smoke attempt, or activation attempt blocks a new
+correction. Keep the same run ID and private state directory, and add
+`--ci-api-isolated` only under the guarded API workflow's isolation conditions.
+
+Combine `--default-runner-tag` and `--runner-tag-map OLD=NEW` on the same command
+when both changes are needed. They are validated and saved atomically; tag-map
+rewrites happen before default insertion. Neither correction can be combined
+with `--omit-ci-project-include`. The transaction revises only saved-run
+configuration, recording old/new default-tag lists, tag maps, configuration
+fingerprints and superseded checkpoints in `runner_tag_revision_*`. Imported
+project identity, snapshots and journals are retained. The original manifest and
+plan JSON remain unchanged; update the manifest separately for future plans.
+
+An identical retry recovers the same deterministic preparation and MR without
+duplicating the configuration revision or remote writes. A different correction
+cannot discard incomplete preparation or ambiguous writes. Review and merge any
+draft MR while CI remains quarantined, then run normal verification and the
+required isolated smoke test before activation. Defaults do not waive complete
+job tag matching, protected-ref checks, or any other runner eligibility gate.
+
+If a migration MR already exists, this correction still refuses to replace its
+evidence. Use the separate explicit amendment below only when its gates hold.
+
+### Add default tags to an existing migration MR
+
+To add destination defaults to an already prepared, unmerged migration MR, use
+`--amend-runner-mr IID` together with `--default-runner-tag TAG`. This preserves
+previous include omissions and other prepared edits on the same source branch
+and MR, rather than creating a replacement. The ordinary correction without
+`--amend-runner-mr` retains its strict pre-write guard.
+
+The following example uses synthetic identifiers and tags:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated \
+  --amend-runner-mr 1 --default-runner-tag it-approved-linux \
+  --allow-source-revision-drift --ci-api-isolated
+```
+
+Use `--allow-source-revision-drift` only for the source-build-only change
+described [below](#gitlab-changed-after-the-copy). Use `--ci-api-isolated` only
+when guarded CI API access is needed and IT satisfies its isolation conditions.
+Both options apply only to that command; neither relaxes amendment eligibility.
+Repeat `--default-runner-tag` for the complete desired nonempty tag list. Do not
+combine an amendment with a new `--runner-tag-map` or
+`--omit-ci-project-include` correction.
+
+Amendment requires an inactive, non-pilot, single-repository Git-copy run with
+completed snapshot/import/baseline and overall preparation, exactly one saved
+owned MR request matching the IID, and no smoke or activation attempt. The actual
+MR must still be open in the recorded project, with its exact saved source head
+and unchanged baseline target; forks, merged/closed MRs, moved heads/targets and
+ambiguous ownership block. Supply a nonempty tag list; it may equal the saved
+policy when this MR still lacks defaults. Existing effective defaults,
+explicit job tags and inheritance opt-outs remain authoritative. If no safe
+default insertion applies, a new amendment is refused without changing the MR.
+
+The tool records a durable `runner_mr_amendment_N` intent with the old request
+and content/configuration hashes before writing, transitioning it from
+`preparing` to `complete` after recovery checks. It marks the same MR Draft and
+adds one `[skip ci]` commit containing only the root CI default-tag addition,
+preserving prior prepared edits. The saved MR commit evidence is updated only
+after identity, content and lint checks pass. Checkpoints and reports contain
+hashes and request evidence, not raw CI YAML. Imported project identity,
+snapshots, journals, original manifest and plan file stay unchanged.
+
+After a failure or lost reply, repeat the same amendment IID and complete tag
+list with the same run/state directory and required runtime attestations. An
+identical retry recovers the existing write without duplicating the commit; a
+different request is blocked while the amendment is pending. Plain `resume`,
+`verify` and `activate` also stop pending recovery and direct you to the exact
+amendment flags. Do not restart `apply` or edit the database to force progress.
+
+Review the new commit again, then mark the MR ready and merge it while CI stays
+quarantined. Normal verification, the required isolated smoke test, and explicit
+activation remain necessary; earlier review of the old MR head is insufficient.
 
 ### Omit an optional project CI include after Git copy
 
@@ -279,7 +409,20 @@ Native import compatibility changes still require separate reconciliation and
 new compatibility evidence where applicable.
 
 If only the **source build revision** keeps changing while its exact version
-string stays the same, use the narrower per-command opt-in:
+string stays the same, use the narrower per-command opt-in on `resume`, `verify`
+or `activate`. For example, to resume an eligible saved default-tag correction:
+
+```sh
+uv run --locked git-migrate resume RUN_ID \
+  --source-frozen --destination-isolated \
+  --default-runner-tag it-approved-linux --allow-source-revision-drift
+```
+
+The [default-tag correction gates](#add-destination-default-tags-after-git-copy)
+remain unchanged. This flag permits only the source build observation; it does
+not authorize a configuration correction or waive completed preparation and
+pre-write requirements. Add `--ci-api-isolated` only when its guarded API access
+is needed and its isolation conditions hold. For verification and activation:
 
 ```sh
 uv run --locked git-migrate verify RUN_ID \
@@ -296,8 +439,12 @@ Known, valid revisions are required. Native or mixed-strategy runs cannot use
 the exception to accept drift. Each distinct accepted observation is retained in
 `source_revision_observation_*` and shown in the report. The saved endpoint
 snapshot, configuration fingerprint, and smoke generation do not change.
-Repeat the flag on each `verify` or `activate` command; observations do not grant
-an ongoing exception. `apply` and `resume` retain strict endpoint checks.
+Repeat the flag on each `resume`, `verify` or `activate` command; observations do
+not grant an ongoing exception. `resume` and `verify` require `--source-frozen`
+and `--destination-isolated`; `activate` requires `--source-frozen`. `apply`
+retains strict endpoint checks. Start/end checks honor only that command's
+opt-in; the exception does not repin snapshots or configuration, reset saved
+refs, or change smoke generations.
 
 If an earlier command passed repository verification and its destination smoke
 test, then failed only the final source-revision comparison, rerun verification

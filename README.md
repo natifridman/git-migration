@@ -76,6 +76,7 @@ Open `migration.yaml` in your editor and update these fields before running any 
 | `runners.tags` | Destination runner tags, such as `[it-approved-linux]`. Planning discovers group and instance runners matching every tag within the enabled scopes and records their IDs per destination project. Use this or `allowed_runner_ids`. |
 | `runners.allowed_runner_ids` | Optional alternative to tags: explicit destination runner IDs supplied by IT, such as `[12345]`. Omit when using `runners.tags`. |
 | `runners.tag_map` | Map each source runner tag to approved destination tags. Replace `legacy-linux` and `it-approved-linux` with your actual tags; use `{}` if no tag changes are needed. |
+| `runners.default_tags` | Defaults to `[]` (disabled). Set approved destination tags such as `[it-approved-linux]` to add a missing CI `default.tags` through a review MR when jobs can inherit it. Existing defaults, job tags, and inheritance opt-outs are preserved. |
 
 For example, the copied manifest maps `engineering` to `migrated-engineering` and keeps the `platform` subgroup beneath it. Replace both group mappings and the repository paths together.
 
@@ -92,6 +93,17 @@ LFS, CI, and workload evidence before production; it does not establish official
 version compatibility. `plan --pilot` marks a run that cannot be activated.
 
 With runner tags, at least one destination group or ancestor must exist for discovery. `group_enabled: true` includes group runners; `shared_enabled: true` includes instance runners. Tag discovery does not change job tags: use `tag_map` when source jobs need different destination tags. The plan records all matching runner IDs, including paused or offline runners; verification still requires an online eligible runner and checks that recorded runners retain the selected tags. Explicit IDs remain available for project runners that must be assigned to the imported project.
+
+Use `default_tags` for jobs that have no tags and permit default inheritance. It
+does not override existing `default.tags` (including defaults from includes),
+explicit `tags: []`, or inheritance opt-outs, and it does not create a CI file.
+Existing eligible Git-copy runs can use the guarded default-tag correction
+described in the [Git-copy workflow](docs/git-copy.md). If an owned migration MR
+already exists, the separate
+[`resume --amend-runner-mr IID --default-runner-tag TAG`](docs/git-copy.md#add-default-tags-to-an-existing-migration-mr)
+can amend that same open MR while preserving prior include omissions. It has
+strict saved-head/preparation gates and requires fresh review of the new commit;
+the ordinary pre-write correction remains unchanged.
 
 **Optional: keep the project list in `repositories.csv`.** This is useful when all projects can use the default direct transfer settings:
 

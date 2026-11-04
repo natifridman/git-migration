@@ -40,6 +40,9 @@ runners:
   # allowed_runner_ids: [12345]
   tag_map:
     legacy-linux: [it-approved-linux]
+  # Optional CI default.tags for jobs accepting defaults; does not select runners.
+  default_tags: []
+  # default_tags: [it-approved-linux]
   shared_enabled: false
   group_enabled: true
 

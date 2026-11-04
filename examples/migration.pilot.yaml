@@ -67,6 +67,9 @@ runners:
     legacy-linux: [it-approved-linux]
     # The synthetic fixture helper uses this source tag; migrate it through a CI MR.
     migration-fixture: [it-approved-linux]
+  # Optional CI default.tags; independent of runner selection and disabled here.
+  default_tags: []
+  # default_tags: [it-approved-linux]
   shared_enabled: false
   group_enabled: true
   enforcement: job_eligibility

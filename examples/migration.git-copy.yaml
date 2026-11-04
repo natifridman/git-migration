@@ -35,6 +35,10 @@ runners:
   tags: [it-approved-linux]
   # Replace the actual source tag if the repository has CI jobs.
   tag_map: {}
+  # Optional CI default.tags for untagged jobs accepting defaults; disabled here.
+  # Existing defaults, explicit tags: [], and inheritance opt-outs are preserved.
+  default_tags: []
+  # default_tags: [it-approved-linux]
   shared_enabled: true
   group_enabled: true
   enforcement: job_eligibility

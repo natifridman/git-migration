@@ -1,5 +1,6 @@
 """Offline integration tests for durable orchestration and activation gates."""
 
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -138,7 +139,7 @@ def test_prepare_checkpoints_snapshot_and_resumes_without_duplicate_import(
     assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
 
 
-@pytest.mark.parametrize("correction", ["tags", "include"])
+@pytest.mark.parametrize("correction", ["tags", "defaults", "combined", "include"])
 def test_ci_correction_recovers_same_mr_and_still_requires_review(
     migration, monkeypatch, correction
 ):
@@ -148,13 +149,14 @@ def test_ci_correction_recovers_same_mr_and_still_requires_review(
     plan.config_hash = plan.config.fingerprint()
     run = store.create_run(plan)
     monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
-    jobs = [{"job": "check", "tags": ["old-linux"]}]
+    jobs = [{"job": "check", "tags": ["old-linux"]}, {"job": "untagged", "tags": []}]
     remote_requests = []
     attempts = []
 
     def prepare_mr(destination, project_id, branch, tag_map, **kwargs):
         assert destination.builds_access_level == "disabled"
         omissions = kwargs["omit_project_includes"]
+        defaults = kwargs["default_tags"]
         if correction == "include" and not omissions:
             return {
                 "status": "blocked",
@@ -162,10 +164,11 @@ def test_ci_correction_recovers_same_mr_and_still_requires_review(
                 "jobs": jobs,
                 "blockers": ["Project CI include requires an explicit destination mapping"],
             }
-        if correction == "tags" and not tag_map:
+        if correction != "include" and not tag_map and not defaults:
             return {"status": "unchanged", "changed": False, "jobs": jobs, "blockers": []}
-        if correction == "tags":
-            assert tag_map == {"old-linux": ["approved"]}
+        if correction != "include":
+            assert tag_map == ({"old-linux": ["approved"]} if correction != "defaults" else {})
+            assert defaults == (["approved"] if correction != "tags" else [])
         else:
             assert omissions == ["team/optional-review"] and not tag_map
         attempts.append(True)
@@ -195,6 +198,10 @@ def test_ci_correction_recovers_same_mr_and_still_requires_review(
     def resume(migrator):
         if correction == "tags":
             return migrator.prepare({"old-linux": ["approved"]})
+        if correction == "defaults":
+            return migrator.prepare(default_tags=["approved"])
+        if correction == "combined":
+            return migrator.prepare({"old-linux": ["approved"]}, default_tags=["approved"])
         return migrator.prepare(omit_ci_project_includes=["team/optional-review"])
 
     assert resume(migrator)["status"] == "blocked"
@@ -222,8 +229,161 @@ def test_ci_correction_recovers_same_mr_and_still_requires_review(
     assert all(data.get("builds_access_level") != "enabled" for _, data in target.writes)
 
 
-@pytest.mark.parametrize("record", ["smoke-journal-20.json", "smoke-owned-20-synthetic.json"])
-@pytest.mark.parametrize("correction", ["tags", "include"])
+@pytest.mark.parametrize("blockers", [[], ["Synthetic CI review blocker"]])
+def test_saved_runner_mr_resume_preserves_default_tag_evidence(migration, monkeypatch, blockers):
+    original, store, _, source, target, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config.runners.default_tags = ["approved"]
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    metadata = {
+        "inserted": True,
+        "reason": "Added default.tags for executable jobs without inherited or explicit tags",
+        "affected_jobs": ["untagged"],
+        "merged_ci_sha256": "f" * 64,
+    }
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "created",
+            "changed": True,
+            "iid": 21,
+            "source_branch": "codex/runner-migration-synthetic",
+            "commit_sha": "b" * 40,
+            "jobs": [{"job": "untagged", "tags": ["approved"]}],
+            "blockers": [],
+            "default_tags": metadata,
+        },
+    )
+    migrator = orchestrator.Migrator(plan, store, run, source, target)
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    saved = store.step(run, "team/repo", "runner_mrs")["data"]["requests"][0]
+    fresh_jobs = [{"job": "freshly-resolved", "tags": ["approved", "linux"]}]
+    checked_requests = []
+
+    def verify_saved(destination, project_id, prepared, **kwargs):
+        assert destination is target and project_id == 20
+        assert kwargs["require_merged"] is False
+        checked_requests.append(prepared)
+        return {"jobs": fresh_jobs, "blockers": blockers}
+
+    monkeypatch.setattr(orchestrator, "verify_prepared_merge_request", verify_saved)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: pytest.fail("Saved MR must be verified without new preparation"),
+    )
+    resumed = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert resumed.prepare()["status"] == ("blocked" if blockers else "awaiting_verification")
+    assert checked_requests == [saved]
+    updated = store.step(run, "team/repo", "runner_mrs")["data"]["requests"][0]
+    assert updated == {**saved, "jobs": fresh_jobs, "blockers": blockers}
+    assert updated["default_tags"] == metadata
+    assert strategy.starts == strategy.polls == 1
+    assert target.builds_access_level == "disabled"
+
+
+@pytest.mark.parametrize("superseded", [False, True])
+@pytest.mark.parametrize("drift", [False, True])
+def test_unchanged_runner_resume_preserves_external_ci_fingerprint(
+    migration, monkeypatch, superseded, drift
+):
+    from git_migration.steps import runners
+
+    original, store, _, source, target, strategy = migration
+    plan = original.plan.model_copy(deep=True)
+    plan.config.repositories[0].strategy = "git_copy"
+    plan.config.runners.default_tags = ["approved"]
+    plan.config_hash = plan.config.fingerprint()
+    run = store.create_run(plan)
+    monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
+    merged_yaml = (
+        "default:\n  tags: [approved]\n"
+        "tagged:\n  tags: [old-linux]\n  script: echo safe\n"
+        "untagged:\n  tags: []\n  script: echo safe\n"
+    )
+    metadata = {
+        "inserted": False,
+        "reason": "Effective CI configuration already declares default.tags",
+        "affected_jobs": [],
+        "merged_ci_sha256": runners._ci_fingerprint(runners._yaml().load(merged_yaml)),
+    }
+    prepared = {
+        "status": "unchanged",
+        "changed": False,
+        "jobs": [
+            {"job": "tagged", "tags": ["old-linux"]},
+            {"job": "untagged", "tags": []},
+        ],
+        "blockers": [],
+        "default_tags": metadata,
+    }
+    monkeypatch.setattr(
+        orchestrator, "prepare_runner_merge_request", lambda *args, **kwargs: dict(prepared)
+    )
+    migrator = orchestrator.Migrator(plan, store, run, source, target)
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    before = store.step(run, "team/repo", "runner_mrs")["data"]
+    original_get = target.get
+    lint_requests = []
+    new_preparations = []
+
+    def get(path, params=None):
+        if path.endswith("/repository/files/.gitlab-ci.yml"):
+            content = "include:\n  project: team/repo\n  file: shared-ci.yml\n"
+            return {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
+        return original_get(path, params)
+
+    def lint(path, data):
+        assert path.endswith("/ci/lint")
+        lint_requests.append(data)
+        return {
+            "valid": True,
+            "merged_yaml": merged_yaml.replace("echo safe", "echo changed")
+            if drift
+            else merged_yaml,
+        }
+
+    def prepare_again(*args, **kwargs):
+        assert superseded and not drift, (
+            "Pinned unchanged CI must be reused or block before preparation"
+        )
+        assert args[3] == {"old-linux": ["approved"]}
+        assert lint_requests, (
+            "The previous fingerprint must be checked before corrected preparation"
+        )
+        new_preparations.append(True)
+        return dict(prepared)
+
+    monkeypatch.setattr(target, "get", get)
+    monkeypatch.setattr(target, "post", lint, raising=False)
+    monkeypatch.setattr(orchestrator, "prepare_runner_merge_request", prepare_again)
+    resumed = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    result = resumed.prepare({"old-linux": ["approved"]} if superseded else None)
+    assert result["status"] == ("blocked" if drift else "awaiting_verification")
+    assert len(lint_requests) == 1 and lint_requests[0]["ref"] == "main"
+    assert new_preparations == ([True] if superseded and not drift else [])
+    after = store.step(run, "team/repo", "runner_mrs")
+    assert after["data"] == before
+    assert after["data"]["requests"][0]["default_tags"] == metadata
+    if drift:
+        assert after["status"] == ("superseded" if superseded else "complete")
+        assert (
+            "Merged CI configuration changed"
+            in store.step(run, "team/repo", "preparation")["data"]["error"]
+        )
+    assert strategy.starts == strategy.polls == 1
+    assert target.builds_access_level == "disabled"
+
+
+@pytest.mark.parametrize(
+    "record",
+    ["smoke-journal-20.json", "smoke-owned-20-synthetic.json", "nested/smoke-journal-20.json"],
+)
+@pytest.mark.parametrize("correction", ["tags", "defaults", "combined", "include"])
 def test_ci_correction_recovers_but_refuses_uncheckpointed_smoke(
     migration, monkeypatch, record, correction
 ):
@@ -240,12 +400,13 @@ def test_ci_correction_recovers_but_refuses_uncheckpointed_smoke(
             "status": "unchanged",
             "changed": False,
             "blockers": [],
-            "jobs": [{"job": "check", "tags": ["old-linux"]}],
+            "jobs": [{"job": "check", "tags": ["old-linux"]}, {"job": "untagged", "tags": []}],
         },
     )
     migrator = orchestrator.Migrator(plan, store, run, source, target)
     assert migrator.prepare()["status"] == "awaiting_verification"
     evidence = migrator._directory(plan.config.repositories[0]) / record
+    evidence.parent.mkdir(exist_ok=True)
     evidence.write_text("{}")
     recovered = []
 
@@ -258,6 +419,10 @@ def test_ci_correction_recovers_but_refuses_uncheckpointed_smoke(
     with pytest.raises(orchestrator.MigrationBlocked, match="smoke recovery or ownership"):
         if correction == "tags":
             migrator.prepare({"old-linux": ["approved"]})
+        elif correction == "defaults":
+            migrator.prepare(default_tags=["approved"])
+        elif correction == "combined":
+            migrator.prepare({"old-linux": ["approved"]}, default_tags=["approved"])
         else:
             migrator.prepare(omit_ci_project_includes=["team/optional-review"])
     assert recovered == [True]
@@ -1084,6 +1249,445 @@ def endpoint_migration(migration, monkeypatch):
     run = store.create_run(plan)
     monkeypatch.setattr(orchestrator, "GitCopyStrategy", lambda *args, **kwargs: strategy)
     return orchestrator.Migrator(plan, store, run, source, target), source, target, strategy, live
+
+
+@pytest.fixture
+def amendable_migration(endpoint_migration, monkeypatch):
+    migrator, source, target, strategy, live = endpoint_migration
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_runner_merge_request",
+        lambda *args, **kwargs: {
+            "status": "created",
+            "changed": True,
+            "iid": 21,
+            "branch": "codex/runner-migration-synthetic",
+            "source_branch": "codex/runner-migration-synthetic",
+            "commit_sha": "b" * 40,
+            "jobs": [{"job": "untagged", "tags": []}],
+            "blockers": [],
+        },
+    )
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    request = migrator.store.step(migrator.run_id, "team/repo", "runner_mrs")["data"]["requests"][0]
+    proposal = {
+        "operation_id": "e" * 64,
+        "project_id": 20,
+        "prepared": request,
+        "default_tags": ["approved"],
+        "ci_path": ".gitlab-ci.yml",
+        "root_before_sha256": "a" * 64,
+        "root_after_sha256": "b" * 64,
+        "root_last_commit_id": "b" * 40,
+        "default_tag_metadata": {
+            "inserted": True,
+            "reason": "Added requested default tags",
+            "affected_jobs": ["untagged"],
+            "merged_ci_sha256": "c" * 64,
+        },
+        "jobs": [{"job": "untagged", "tags": ["approved"]}],
+    }
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_prepared_merge_request",
+        lambda *args, **kwargs: {
+            "jobs": args[2]["jobs"],
+            "blockers": [],
+        },
+    )
+    return migrator, source, target, strategy, live, proposal
+
+
+def test_existing_runner_mr_amendment_recovers_lost_response_and_keeps_review_gate(
+    amendable_migration, monkeypatch
+):
+    from git_migration.compatibility import CompatibilityBlocked
+    from git_migration.state import RunnerMRAmendmentBlocked
+
+    migrator, source, target, strategy, live, proposal = amendable_migration
+    store, run = migrator.store, migrator.run_id
+    original_plan = store.plan(run)
+    imported = store.step(run, "team/repo", "import")
+    snapshot = store.step(run, "team/repo", "snapshot")
+    planned, applied, remote_writes = [], [], []
+    live["source"]["revision"] = "c" * 40
+
+    def plan(*args, **kwargs):
+        assert args[2] == proposal["prepared"] and args[3] == ["approved"]
+        assert store.pending_runner_amendment(run) is None
+        planned.append(True)
+        return proposal
+
+    def apply(destination, project_id, saved):
+        intent = store.pending_runner_amendment(run)
+        assert intent and intent["data"]["proposal"] == saved == proposal
+        assert store.plan(run) == original_plan
+        applied.append(True)
+        if not remote_writes:
+            remote_writes.append("c" * 40)
+            raise ProviderError(503)  # The same MR was amended, but its reply was lost.
+        return {
+            **saved["prepared"],
+            "status": "amended",
+            "changed": True,
+            "commit_sha": remote_writes[0],
+            "jobs": saved["jobs"],
+            "default_tags": saved["default_tag_metadata"],
+        }
+
+    monkeypatch.setattr(orchestrator, "plan_runner_default_amendment", plan)
+    monkeypatch.setattr(orchestrator, "apply_runner_default_amendment", apply)
+    with pytest.raises(CompatibilityBlocked):
+        migrator.prepare(default_tags=["approved"], amend_runner_mr=21)
+    assert not planned
+    with pytest.raises(ProviderError):
+        migrator.prepare(
+            default_tags=["approved"], amend_runner_mr=21, allow_source_revision_drift=True
+        )
+    assert store.plan(run) == original_plan
+    assert store.step(run, "team/repo", "runner_mrs")["data"]["requests"] == [proposal["prepared"]]
+    assert store.pending_runner_amendment(run)["status"] == "preparing"
+    for operation in (migrator.prepare, migrator.verify, migrator.activate):
+        with pytest.raises(orchestrator.MigrationBlocked, match="--amend-runner-mr 21"):
+            operation()
+    with pytest.raises(RunnerMRAmendmentBlocked, match="--default-runner-tag approved"):
+        migrator.prepare(
+            default_tags=["different"], amend_runner_mr=21, allow_source_revision_drift=True
+        )
+    assert planned == applied == [True]
+    assert migrator.report()[
+        "steps"
+    ]  # Reporting remains available while remote outcome is pending.
+    restarted = orchestrator.Migrator(store.plan(run), store, run, source, target)
+    assert (
+        restarted.prepare(
+            default_tags=["approved"], amend_runner_mr=21, allow_source_revision_drift=True
+        )["status"]
+        == "awaiting_verification"
+    )
+    assert planned == [True] and applied == [True, True] and len(remote_writes) == 1
+    updated = store.step(run, "team/repo", "runner_mrs")["data"]["requests"][0]
+    assert updated["iid"] == proposal["prepared"]["iid"] == 21
+    assert (
+        updated["commit_sha"] == "c" * 40
+        and updated["default_tags"] == proposal["default_tag_metadata"]
+    )
+    audit = store.step(run, "team/repo", "runner_mr_amendment_1")
+    assert audit["status"] == "complete"
+    assert (
+        restarted.prepare(
+            default_tags=["approved"], amend_runner_mr=21, allow_source_revision_drift=True
+        )["status"]
+        == "awaiting_verification"
+    )
+    assert store.step(run, "team/repo", "runner_mr_amendment_1") == audit
+    assert store.step(run, "team/repo", "runner_mr_amendment_2") is None
+    assert planned == [True] and applied == [True, True]
+    assert store.step(run, "team/repo", "preparation")["data"]["awaiting_review"] is True
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_runner_configuration",
+        lambda *args, **kwargs: {
+            "jobs": [],
+            "blockers": ["Migration merge request has not been reviewed and merged"],
+        },
+    )
+    assert restarted.verify(allow_source_revision_drift=True)["status"] == "blocked"
+    assert restarted.activate(allow_source_revision_drift=True)["status"] == "blocked"
+    assert store.step(run, "team/repo", "import") == imported
+    assert store.step(run, "team/repo", "snapshot") == snapshot
+    assert store.plan(run).endpoint_snapshot == original_plan.endpoint_snapshot
+    assert store.plan(run).config.runners.default_tags == ["approved"]
+    assert store.endpoint_generation(run) == 0
+    assert strategy.starts == strategy.polls == 1
+    assert (
+        store.step(run, "team/repo", "smoke") is None and target.builds_access_level == "disabled"
+    )
+
+
+@pytest.mark.parametrize(
+    "record", ["smoke-journal-20.json", "nested/smoke-owned-20-synthetic.json"]
+)
+def test_existing_runner_mr_amendment_refuses_smoke_evidence_even_after_recovery(
+    amendable_migration, monkeypatch, record
+):
+    from git_migration.state import RunnerMRAmendmentBlocked
+
+    migrator, _, _, _, _, _ = amendable_migration
+    original_plan = migrator.store.plan(migrator.run_id)
+    evidence = migrator._directory(migrator.plan.config.repositories[0]) / record
+    evidence.parent.mkdir(exist_ok=True)
+    evidence.write_text("{}")
+    recovered = []
+
+    def recover(self):
+        evidence.unlink()
+        recovered.append(True)
+
+    monkeypatch.setattr(orchestrator.Migrator, "_recover_smokes", recover)
+    monkeypatch.setattr(
+        orchestrator,
+        "plan_runner_default_amendment",
+        lambda *args, **kwargs: pytest.fail("Smoke attempt must stop before planning"),
+    )
+    with pytest.raises(RunnerMRAmendmentBlocked, match="smoke"):
+        migrator.prepare(default_tags=["approved"], amend_runner_mr=21)
+    assert recovered == [True]
+    assert migrator.store.plan(migrator.run_id) == original_plan
+    assert migrator.store.pending_runner_amendment(migrator.run_id) is None
+
+
+def test_pending_runner_mr_amendment_refuses_new_smoke_journal_after_cleanup(
+    amendable_migration, monkeypatch
+):
+    from git_migration.state import RunnerMRAmendmentBlocked
+
+    migrator, _, _, _, _, proposal = amendable_migration
+    store, run = migrator.store, migrator.run_id
+    intent = store.begin_runner_mr_amendment(
+        run, 21, ["approved"], migrator.plan.config_hash, proposal
+    )
+    evidence = (
+        migrator._directory(migrator.plan.config.repositories[0]) / "nested/smoke-journal-20.json"
+    )
+    evidence.parent.mkdir(exist_ok=True)
+    evidence.write_text("{}")
+    recovered = []
+
+    def recover(self):
+        evidence.unlink()
+        recovered.append(True)
+
+    monkeypatch.setattr(orchestrator.Migrator, "_recover_smokes", recover)
+    monkeypatch.setattr(
+        orchestrator,
+        "plan_runner_default_amendment",
+        lambda *args, **kwargs: pytest.fail("Pending intent must not be replanned"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "apply_runner_default_amendment",
+        lambda *args, **kwargs: pytest.fail("New smoke attempt must stop before remote amendment"),
+    )
+    with pytest.raises(RunnerMRAmendmentBlocked, match="smoke"):
+        migrator.prepare(default_tags=["approved"], amend_runner_mr=21)
+    assert recovered == [True]
+    assert store.pending_runner_amendment(run) == intent
+    assert store.plan(run).config.runners.default_tags == []
+
+
+@pytest.mark.parametrize("fault", ["incomplete", "multiple_requests", "native"])
+def test_existing_runner_mr_amendment_validates_saved_run_before_provider_access(
+    amendable_migration, monkeypatch, fault
+):
+    from git_migration.state import RunnerMRAmendmentBlocked
+
+    migrator, _, _, _, _, _ = amendable_migration
+    store, run = migrator.store, migrator.run_id
+    if fault == "incomplete":
+        store.save(run, "team/repo", "preparation", "failed", {"error": "retain ambiguity"})
+    elif fault == "multiple_requests":
+        data = store.step(run, "team/repo", "runner_mrs")["data"]
+        data["requests"].append(dict(data["requests"][0]))
+        store.save(run, "team/repo", "runner_mrs", "complete", data)
+    else:
+        migrator.plan.config.repositories[0].strategy = "direct_transfer"
+        migrator.plan.config_hash = migrator.plan.config.fingerprint()
+        with store.connection() as db:
+            db.execute("UPDATE runs SET plan=? WHERE id=?", (migrator.plan.model_dump_json(), run))
+    monkeypatch.setattr(
+        orchestrator,
+        "recover_ci_api",
+        lambda *args: pytest.fail("Unsafe saved run must stop before recovery"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "plan_runner_default_amendment",
+        lambda *args, **kwargs: pytest.fail("Unsafe saved run must stop before planning"),
+    )
+    with pytest.raises(RunnerMRAmendmentBlocked):
+        migrator.prepare(default_tags=["approved"], amend_runner_mr=21)
+    assert store.pending_runner_amendment(run) is None
+
+
+def test_prepare_source_revision_exception_audits_before_correction_and_recovers_same_import(
+    endpoint_migration, monkeypatch
+):
+    from git_migration.compatibility import CompatibilityBlocked
+
+    migrator, source, target, strategy, live = endpoint_migration
+    remote_requests = []
+    attempts = []
+
+    def prepare_mr(*args, **kwargs):
+        if not kwargs["default_tags"]:
+            return {
+                "status": "unchanged",
+                "changed": False,
+                "jobs": [{"job": "untagged", "tags": []}],
+                "blockers": [],
+            }
+        attempts.append(True)
+        if not remote_requests:
+            remote_requests.append(
+                {
+                    "status": "created",
+                    "changed": True,
+                    "iid": 21,
+                    "source_branch": "codex/runner-migration-synthetic",
+                    "commit_sha": "b" * 40,
+                    "jobs": [{"job": "untagged", "tags": ["approved"]}],
+                    "blockers": [],
+                }
+            )
+            raise ProviderError(503)
+        return dict(remote_requests[0])
+
+    monkeypatch.setattr(orchestrator, "prepare_runner_merge_request", prepare_mr)
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    store, run = migrator.store, migrator.run_id
+    original_plan = store.plan(run)
+    imported = store.step(run, "team/repo", "import")
+    live["source"]["revision"] = "c" * 40
+    target.writes.clear()
+    with pytest.raises(CompatibilityBlocked, match="source revision"):
+        migrator.prepare(default_tags=["approved"])
+    assert not target.writes
+    assert store.plan(run) == original_plan
+    assert store.step(run, "team/repo", "runner_tag_revision_1") is None
+    revise_tags = store.revise_runner_tags
+    checked_corrections = []
+
+    def revise(*args, **kwargs):
+        observations = [
+            step
+            for step in store.report(run)["steps"]
+            if step["name"].startswith("source_revision_observation_")
+        ]
+        assert len(observations) == 1
+        assert (
+            observations[0]["data"]["planned_endpoint_snapshot"] == original_plan.endpoint_snapshot
+        )
+        assert (
+            observations[0]["data"]["observed_endpoint_snapshot"]["source"]["revision"] == "c" * 40
+        )
+        with pytest.raises(RuntimeError, match="holds this state directory"), store.lock():
+            pytest.fail("Endpoint observation and correction require the workspace lock")
+        checked_corrections.append(True)
+        return revise_tags(*args, **kwargs)
+
+    monkeypatch.setattr(store, "revise_runner_tags", revise)
+    assert (
+        migrator.prepare(default_tags=["approved"], allow_source_revision_drift=True)["status"]
+        == "blocked"
+    )
+    revised_plan = store.plan(run)
+    restarted = orchestrator.Migrator(revised_plan, store, run, source, target)
+    target.writes.clear()
+    with pytest.raises(CompatibilityBlocked, match="source revision"):
+        restarted.prepare(default_tags=["approved"])
+    assert not target.writes  # Prior observations do not authorize another command.
+    assert (
+        restarted.prepare(default_tags=["approved"], allow_source_revision_drift=True)["status"]
+        == "awaiting_verification"
+    )
+    assert checked_corrections == attempts == [True, True]
+    assert len(remote_requests) == strategy.starts == strategy.polls == 1
+    assert store.step(run, "team/repo", "import") == imported
+    assert store.step(run, "team/repo", "runner_tag_revision_2") is None
+    assert store.plan(run) == revised_plan
+    assert revised_plan.endpoint_snapshot == original_plan.endpoint_snapshot
+    assert revised_plan.config.runners.default_tags == ["approved"]
+    assert (
+        revised_plan.config_hash == revised_plan.config.fingerprint() != original_plan.config_hash
+    )
+    assert store.endpoint_generation(run) == 0
+    assert store.step(run, "team/repo", "smoke") is None
+    assert target.builds_access_level == "disabled"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "source_version",
+        "destination_version",
+        "destination_revision",
+        "unknown_revision",
+        "native",
+        "pilot",
+    ],
+)
+def test_prepare_source_revision_exception_keeps_endpoint_and_strategy_gates(
+    endpoint_migration, fault
+):
+    from git_migration.compatibility import CompatibilityBlocked
+
+    migrator, source, target, strategy, live = endpoint_migration
+    assert migrator.prepare()["status"] == "awaiting_verification"
+    live["source"]["revision"] = "c" * 40
+    if fault in {"native", "pilot"}:
+        plan = migrator.plan.model_copy(deep=True)
+        if fault == "native":
+            plan.config.repositories[0].strategy = "direct_transfer"
+        else:
+            plan.pilot = True
+        plan.config_hash = plan.config.fingerprint()
+        run = migrator.store.create_run(plan)
+        migrator = orchestrator.Migrator(plan, migrator.store, run, source, target)
+    elif fault == "source_version":
+        live["source"]["version"] = "18.4.2"
+    elif fault == "destination_version":
+        live["destination"]["version"] = "18.4.2"
+    elif fault == "destination_revision":
+        live["destination"]["revision"] = "d" * 40
+    else:
+        live["source"]["revision"] = ""
+    before = migrator.store.plan(migrator.run_id)
+    target.writes.clear()
+    with pytest.raises(CompatibilityBlocked):
+        migrator.prepare(default_tags=["approved"], allow_source_revision_drift=True)
+    assert not target.writes
+    assert migrator.store.plan(migrator.run_id) == before
+    assert not any(
+        step["name"].startswith(("source_revision_observation_", "runner_tag_revision_"))
+        for step in migrator.report()["steps"]
+    )
+    assert strategy.starts == 1
+
+
+@pytest.mark.parametrize("allow_drift", [False, True])
+@pytest.mark.parametrize(
+    "side,field", [("source", "revision"), ("source", "version"), ("destination", "revision")]
+)
+def test_prepare_rechecks_endpoints_after_work(
+    endpoint_migration, monkeypatch, allow_drift, side, field
+):
+    from git_migration.compatibility import CompatibilityBlocked
+
+    migrator, _, target, strategy, live = endpoint_migration
+    original_plan = migrator.store.plan(migrator.run_id)
+
+    def prepare_mr(*args, **kwargs):
+        live[side][field] = "18.4.2" if field == "version" else "d" * 40
+        return {"status": "no_ci", "changed": False, "jobs": [], "blockers": []}
+
+    monkeypatch.setattr(orchestrator, "prepare_runner_merge_request", prepare_mr)
+    if allow_drift and (side, field) == ("source", "revision"):
+        assert (
+            migrator.prepare(allow_source_revision_drift=True)["status"] == "awaiting_verification"
+        )
+        assert any(
+            step["name"].startswith("source_revision_observation_")
+            for step in migrator.report()["steps"]
+        )
+    else:
+        with pytest.raises(CompatibilityBlocked):
+            migrator.prepare(allow_source_revision_drift=allow_drift)
+        assert migrator.report()["status"] == "blocked"
+    assert migrator.store.plan(migrator.run_id) == original_plan
+    assert migrator.store.endpoint_generation(migrator.run_id) == 0
+    assert strategy.starts == 1
+    assert target.builds_access_level == "disabled"
 
 
 @pytest.mark.parametrize(

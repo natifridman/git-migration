@@ -53,10 +53,15 @@ def test_runner_selection_rejects_missing_ambiguous_or_invalid_selectors(profile
         RunnerProfile.model_validate(profile)
 
 
-def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None:
-    config = MigrationConfig.model_validate(manifest())
+@pytest.mark.parametrize("selection", [{"allowed_runner_ids": [7]}, {"tags": ["selected"]}])
+def test_existing_plan_fingerprint_is_preserved(tmp_path: Path, selection) -> None:
+    data = manifest()
+    data["runners"] = selection
+    config = MigrationConfig.model_validate(data)
     original = config.model_dump(mode="json")
-    original["runners"].pop("tags")
+    if not config.runners.tags:
+        original["runners"].pop("tags")
+    original["runners"].pop("default_tags")
     original["runners"].pop("enforcement")
     original.pop("compatibility")
     original.pop("variables")
@@ -78,6 +83,47 @@ def test_existing_id_based_plan_fingerprint_is_preserved(tmp_path: Path) -> None
         )
     )
     assert load_plan(path).config_hash == old_hash
+
+
+@pytest.mark.parametrize("selection", [{"allowed_runner_ids": [7]}, {"tags": ["selected"]}])
+def test_default_runner_tags_are_independent_and_fingerprinted(selection):
+    data = manifest()
+    data["runners"] = selection
+    original = MigrationConfig.model_validate(data).fingerprint()
+    data["runners"]["default_tags"] = []
+    assert MigrationConfig.model_validate(data).fingerprint() == original
+    data["runners"]["default_tags"] = ["approved", "linux"]
+    config = MigrationConfig.model_validate(data)
+    assert config.runners.default_tags == ["approved", "linux"]
+    assert config.fingerprint() != original
+    assert config.runners.tags == selection.get("tags", [])
+    assert config.runners.allowed_runner_ids == selection.get("allowed_runner_ids", [])
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        [""],
+        [" leading"],
+        ["two words"],
+        ["$RUNNER"],
+        ["linux,docker"],
+        ["x=y"],
+        ["linux", "linux"],
+        [f"tag-{number}" for number in range(50)],
+        [7],
+    ],
+)
+def test_default_runner_tags_require_unique_literal_tags_below_fifty(tags):
+    with pytest.raises(ValidationError):
+        RunnerProfile.model_validate({"allowed_runner_ids": [7], "default_tags": tags})
+
+
+def test_default_runner_tags_allow_forty_nine_but_do_not_select_runners():
+    tags = [f"tag-{number}" for number in range(49)]
+    assert RunnerProfile(allowed_runner_ids=[7], default_tags=tags).default_tags == tags
+    with pytest.raises(ValidationError, match="Choose either runner tags"):
+        RunnerProfile(default_tags=["approved"])
 
 
 def test_ci_include_omissions_are_explicit_and_fingerprinted():
