@@ -29,6 +29,21 @@ Set `runners.tags` to approved destination tags, for example `[it-approved-linux
 
 Match the complete job tag set and protected-ref requirements. Tag discovery selects approved runners; use `runners.tag_map` to change source CI job tags when needed. An untagged job needs an approved runner with untagged execution enabled. Group and instance runners are inherited according to project flags; the tool does not modify a runner fleet. Every accessible unpaused runner outside the resolved or explicit allowlist is a blocker, even when offline or using different tags. Replace example tags and IDs with approved values.
 
+For jobs that intentionally use CI defaults, opt in separately with
+`runners.default_tags: [it-approved-linux]`. The default is `[]` (disabled).
+This is a list of at most 49 unique, nonempty literal tags, without whitespace,
+`$`, `=`, or commas. It is independent of `runners.tags`, which selects runners.
+After explicit `tag_map` edits, preparation can add root CI `default.tags` when
+there is no effective existing `default.tags` declaration and at least one job
+has no tags and accepts tag defaults. An existing default, including one from an
+include or `default.tags: []`, is preserved. Explicit job tags, including `[]`,
+template/`extends` inheritance, and `inherit:default` opt-outs or allowlists are
+respected. Reliable effective CI resolution is required; unsupported or dynamic
+configuration and project includes without reliable merged-lint evidence block.
+Review the proposed MR and the complete resulting job tags against the approved
+runners. This option changes CI configuration only; it does not change runners,
+create CI for a `no_ci` project, or broaden downstream-pipeline support.
+
 ## 3. Plan, inspect, and import a disposable pilot
 
 Run `plan MANIFEST --output plan.json` against the actual source and destination. Check every finding, version/capability result, group mapping, selected strategy, source identity, and target path. There is no silent fallback from direct transfer to file import. Review the file-import membership acceptance gate and identity limits before enabling that strategy. Keep destination groups precreated unless explicit creation under the mapped hierarchy is intended.
@@ -98,19 +113,47 @@ on the existing destination. Native imports still need compatibility
 reconciliation; do not restart an import into an occupied project.
 
 For repeated source **build revision** changes with an unchanged source version
-and destination identity, Git-copy verification and activation support the
-narrower `--allow-source-revision-drift` opt-in, documented in that procedure.
+and destination identity, non-pilot Git-copy resume, verification and activation
+support the narrower `--allow-source-revision-drift` opt-in in that procedure.
 It audits accepted observations and retains valid destination smoke evidence.
-Reattest source freeze and destination isolation on `verify`, and repeat the
-opt-in with `--source-frozen` on `activate`. Frozen repository data and reviewed
-configuration are still verified on each command.
+Reattest source freeze and destination isolation on `resume` or `verify`, and
+repeat the opt-in with `--source-frozen` on `activate`. The flag applies to one
+command, including its start/end checks, and does not change saved snapshots,
+configuration hashes or smoke generations. `apply` stays strict. Source version,
+both endpoint URLs and the entire destination identity stay pinned. Correction,
+preparation, review, verification and activation gates remain required.
 
-If a Git-copy run has a job-tag mismatch and `runner_mrs` contains only unchanged
-configuration, use the [saved-run tag correction](git-copy.md#correct-a-missing-tag-mapping-after-git-copy)
+If a Git-copy run has a job-tag mismatch, overall preparation completed, and
+`runner_mrs` contains only unchanged configuration, use the [saved-run tag correction](git-copy.md#correct-a-missing-tag-mapping-after-git-copy)
 after confirming the intended runner fleet. `resume --runner-tag-map OLD=NEW` is
-limited to one repository before any CI MR, smoke or activation attempt. It
+limited to one repository before any CI write/MR, smoke or activation attempt. It
 audits the revision and prepares a review MR while preserving the completed
 import. Changing `runners.tags` alone does not change job tags.
+
+For an existing untagged job that should accept destination tag defaults, the
+same guarded revision supports repeatable
+[`resume --default-runner-tag TAG`](git-copy.md#add-destination-default-tags-after-git-copy).
+It requires an inactive, non-pilot, single-repository Git-copy run with completed
+snapshot/import/baseline, completed overall preparation, and unchanged runner
+preparation. It may be combined
+atomically with `--runner-tag-map`, but not with
+`--omit-ci-project-include`. Existing defaults and inheritance still take
+precedence, so an accepted correction can produce no CI change. The original
+manifest and plan file remain unchanged; inspect the saved-run audit and review
+any draft MR before verification and activation.
+
+If an owned migration MR already exists, the pre-write correction above still
+refuses it. The separate
+[`resume --amend-runner-mr IID --default-runner-tag TAG`](git-copy.md#add-default-tags-to-an-existing-migration-mr)
+can add defaults to that same open MR and branch while preserving previous
+include omissions. It requires completed preparation, one saved matching owned
+MR, unchanged source head/baseline target, and no smoke or activation attempt.
+It cannot accompany a new tag-map or include-omission correction, and refuses a
+new amendment when defaults cannot safely be added. Durable amendment intent
+protects interrupted writes: repeat the exact IID/tag list for recovery;
+ordinary resume, verification and activation stop while it is pending. Review
+the new skip-CI commit afresh before merging; quarantine and all later gates stay
+required.
 
 Review and merge each generated migration MR. Migration commits intentionally change branch object IDs, so use the verifier's recorded migration-MR evidence when assessing expected differences. Do not discard unexplained ref differences. Verification compares repository branches/tags/default branch and LFS object identities, MR state/metadata and discussion contents, scoped variable reconciliation, runner eligibility, and required preparation evidence. Imported historical pipeline success is not evidence that destination CI works.
 

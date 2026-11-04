@@ -22,6 +22,7 @@ from git_migration.state import (
     StateStore,
     atomic_json,
     validate_ci_include_omissions,
+    validate_default_runner_tags,
     validate_runner_tag_changes,
 )
 from git_migration.steps.preflight import build_plan
@@ -180,10 +181,26 @@ def resume_command(
         False,
         help="Allow quarantined Git-copy CI API access; attest IT excluded external triggers and policy-injected jobs",
     ),
+    allow_source_revision_drift: bool = typer.Option(
+        False,
+        help="Git copy only: audit source build-revision drift while pinning versions and destination identity",
+    ),
     runner_tag_map: Annotated[
         list[str] | None,
         typer.Option(
             help="Correct saved Git-copy job tags before any CI MR: OLD=NEW[,NEW]; repeat as needed"
+        ),
+    ] = None,
+    default_runner_tag: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Replace saved Git-copy default job tags; use --amend-runner-mr for an existing MR; repeat for each tag"
+        ),
+    ] = None,
+    amend_runner_mr: Annotated[
+        int | None,
+        typer.Option(
+            min=1, help="Explicitly add default tags to this saved, open migration MR IID"
         ),
     ] = None,
     omit_ci_project_include: Annotated[
@@ -199,9 +216,15 @@ def resume_command(
         raise typer.Exit(2)
 
     def action() -> None:
+        if amend_runner_mr is not None and (
+            not default_runner_tag or runner_tag_map or omit_ci_project_include
+        ):
+            raise RunnerTagRevisionBlocked(
+                "--amend-runner-mr requires --default-runner-tag and cannot combine with tag-map or include corrections"
+            )
         if omit_ci_project_include:
             validate_ci_include_omissions(omit_ci_project_include)
-            if runner_tag_map:
+            if runner_tag_map or default_runner_tag is not None:
                 raise RunnerTagRevisionBlocked(
                     "Correct runner tags and CI include omissions separately"
                 )
@@ -213,12 +236,23 @@ def resume_command(
             changes[old] = targets.split(",")
         if changes:
             validate_runner_tag_changes(changes)
+        if default_runner_tag is not None:
+            validate_default_runner_tags(default_runner_tag)
         store = StateStore(ctx.obj)
         migrator = Migrator(store.plan(run_id), store, run_id, ci_api_isolated=ci_api_isolated)
+        options: dict[str, Any] = (
+            {"allow_source_revision_drift": True} if allow_source_revision_drift else {}
+        )
+        if amend_runner_mr is not None:
+            options["amend_runner_mr"] = amend_runner_mr
         if omit_ci_project_include:
-            _finish(migrator.prepare(omit_ci_project_includes=omit_ci_project_include))
+            _finish(migrator.prepare(omit_ci_project_includes=omit_ci_project_include, **options))
+        elif default_runner_tag is not None:
+            _finish(migrator.prepare(changes, default_tags=default_runner_tag, **options))
         else:
-            _finish(migrator.prepare(changes) if changes else migrator.prepare())
+            _finish(
+                migrator.prepare(changes, **options) if changes else migrator.prepare(**options)
+            )
 
     _guard(action)
 

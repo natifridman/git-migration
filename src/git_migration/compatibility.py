@@ -94,9 +94,10 @@ def verify_endpoints(
                     before = before if re.fullmatch(pattern, before) else "unavailable"
                     details.append(f"{side} {field}: {before} -> {after or 'unavailable'}")
         guidance = (
-            "For Git copy, use --allow-source-revision-drift to audit source build changes while "
-            "keeping versions and destination identity pinned; verify also requires --source-frozen "
-            "and --destination-isolated. Repeat the opt-in on activate"
+            "For Git copy, use --allow-source-revision-drift on resume, verify or activate to audit "
+            "source build changes while keeping versions and destination identity pinned; "
+            "resume and verify also require --source-frozen and --destination-isolated. "
+            "Repeat the opt-in on each command; apply remains strict"
             if source_revision_only
             else "For a completed Git-copy import, review this change and use verify --refresh-endpoints "
             "--source-frozen --destination-isolated on the same run; fresh verification is required"

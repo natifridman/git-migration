@@ -64,9 +64,10 @@ an ambiguous write. Manifest/plan files remain unchanged. No schema change is
 required; lock-time configuration checks still reject stale commands.
 
 `resume --runner-tag-map` permits a scoped configuration revision only for a
-single non-pilot Git-copy run after baseline verification and unchanged runner
-preparation, before CI edits/MRs, smoke, or activation. Under the workspace lock,
-one SQLite transaction records the previous/new tag maps and configuration
+single non-pilot Git-copy run after baseline verification and completed overall
+preparation, with unchanged runner preparation and no errors or pending review,
+before CI edits/MRs, smoke, or activation. Under the workspace lock,
+one SQLite transaction records the previous/new tag maps, default-tag lists and configuration
 hashes, retains superseded preparation/verification evidence in a revision
 checkpoint, and saves a newly fingerprinted run plan. Import identities and
 snapshots remain untouched. The saved plan JSON file is not rewritten. This is
@@ -76,6 +77,65 @@ that loaded a prior configuration hash stop after acquiring the lock. Repeating
 the identical correction resumes the same deterministic MR preparation without
 revising evidence again. A different correction is refused while preparation is
 incomplete, including an ambiguous remote write.
+
+`runners.default_tags` defaults to an empty list, which is omitted from the
+configuration fingerprint so existing saved plans/checkpoints require no schema
+migration. A nonempty list is fingerprinted separately from runner-selection
+`runners.tags`. CI preparation applies explicit `tag_map` rewrites first, then
+can add root `default.tags` only if effective CI has no existing default tag
+declaration and a job lacks tags while accepting defaults. Existing root or
+included defaults, including empty defaults, explicit job tags, templates and
+`extends`, and `inherit:default` opt-outs/allowlists are preserved. Local/include
+resolution and reliable merged-lint evidence must establish effective behavior;
+unsupported/dynamic configuration or project includes without that evidence
+block. The option does not configure runners, create CI for `no_ci`, or expand
+downstream-pipeline support. It uses the deterministic review-MR and quarantine
+workflow and leaves verification/activation gates unchanged.
+
+For project includes, `default_tags.merged_ci_sha256` fingerprints the resolved
+configuration after the insertion decision. A migration commit records that evidence;
+retry and verification require fresh merged lint to match it. Branch identity
+uses the frozen source, pre-insertion edits and requested defaults, so external
+include drift cannot select a new branch or erase an uncertain earlier write.
+If drift changes insertion into a no-op, existing branch/MR evidence still
+requires reconciliation.
+
+Repeatable `resume --default-runner-tag TAG` uses the same saved-run revision
+transaction and `runner_tag_revision_*` audit as tag-map correction, with
+old/new lists, maps, hashes and superseded evidence. It requires an inactive,
+single non-pilot Git-copy run with completed snapshot/import/baseline and overall
+preparation, and unchanged runner preparation, before any CI write/MR, smoke or activation
+attempt, and at least one saved untagged job. Existing defaults and inheritance
+can still make insertion a no-op. Default-tag and tag-map corrections can be
+submitted atomically; neither combines with `--omit-ci-project-include`.
+Original manifest/plan files and import identities remain untouched. Identical
+retries recover the same deterministic preparation; a different correction
+cannot discard incomplete preparation or ambiguous writes.
+
+`resume --amend-runner-mr IID --default-runner-tag TAG` is a separate saved-run
+operation for one existing owned open MR, not an expansion of the pre-write
+correction. It requires an inactive, single non-pilot Git-copy run, completed
+snapshot/import/baseline and preparation, exactly one saved MR matching the IID,
+the exact saved source head and unchanged baseline target in the same project,
+and no smoke/activation attempt. A nonempty default-tag list is mandatory;
+new tag-map or include-omission corrections cannot accompany it. Effective
+defaults, explicit tags and inheritance remain authoritative, and no applicable
+insertion blocks a new amendment without mutation.
+
+Before remote writes, durable `runner_mr_amendment_N` intent saves the old MR
+request, safe proposal, superseded steps, old/new default tags and
+content/configuration hashes with status `preparing`; it stores no raw CI YAML
+in checkpoints or reports. Retained snapshot/import/baseline evidence must still
+match on replay. Completion retains the updated request with status
+`complete`. The operation marks the same MR Draft and adds one skip-CI commit
+that adds root defaults while preserving all prior prepared changes. Saved MR
+commit evidence changes only after identity, content and lint verification.
+Identical retries reconcile lost replies without duplicate commits; different
+requests and ordinary resume/verify/activate stop while intent is pending and
+require the exact amendment flags. Imported identities/snapshots and original
+manifest/plan files stay untouched. Operators must review the new commit before
+merge, verification, isolated smoke and activation under the existing quarantine.
+The additive amendment checkpoints require no schema or saved-plan conversion.
 
 `verify --refresh-endpoints` permits an explicit endpoint-evidence revision after
 all imports and CI preparation complete in a non-pilot, entirely Git-copy run,
@@ -93,16 +153,19 @@ generation, while a later refresh (even back to an earlier revision) requires a
 new pipeline. Verification checks versions again before marking the run verified,
 and activation rechecks before enabling execution.
 
-The separate runtime `--allow-source-revision-drift` option on verification and
-activation tolerates exactly the source revision field in non-pilot Git-copy
-runs. Source version/URL and the entire destination identity remain pinned;
+The separate runtime `--allow-source-revision-drift` option on resume,
+verification and activation tolerates exactly the source revision field in
+non-pilot Git-copy runs. Source version/URL and the entire destination identity remain pinned;
 missing or invalid revisions block. Each distinct accepted planned/observed
 snapshot pair is durably recorded as `source_revision_observation_*` under the
 workspace lock before continuing. Observations do not modify the plan, hash,
 endpoint generation, or smoke evidence and do not authorize later commands.
-Both start/end checks honor the per-command choice, with full repository and CI
-verification between them. Existing plans/checkpoints need no format conversion;
-the default, native and mixed-strategy behavior stays strict.
+Both start/end checks honor the per-command choice, with normal preparation or
+repository/CI verification between them. Resume and verification require source
+freeze and destination isolation; activation requires source freeze. This does
+not relax configuration-correction gates or alter frozen snapshots. Existing
+plans/checkpoints need no format conversion. Apply and all commands without the
+opt-in stay strict, as do native and mixed-strategy runs.
 
 `--ci-api-isolated` is a per-command runtime attestation, so it does not change the
 saved-plan fingerprint or schema. On destination CI-API HTTP 403, eligible

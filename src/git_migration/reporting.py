@@ -21,6 +21,14 @@ def show_report(report: dict[str, Any]) -> None:
     for step in report.get("steps", []):
         typer.echo(f"  {step['resource']} / {step['name']}: {step['status']}")
         data = step.get("data", {})
+        if step["name"].startswith("runner_mr_amendment_") and data.get("iid"):
+            if step["status"] == "preparing":
+                typer.echo(
+                    f"    Pending update to MR !{data['iid']}; repeat resume with "
+                    f"--amend-runner-mr {data['iid']} and the same --default-runner-tag options"
+                )
+            elif step["status"] == "complete":
+                typer.echo(f"    Recorded default-tag amendment for MR !{data['iid']}")
         if data.get("source_revision_drift_accepted"):
             before = data["planned_endpoint_snapshot"]["source"]
             after = data["observed_endpoint_snapshot"]["source"]
@@ -40,6 +48,17 @@ def show_report(report: dict[str, Any]) -> None:
         if data.get("error"):
             typer.echo(f"    {data['error']}")
         for request in data.get("requests", []):
+            if default_tags := request.get("default_tags"):
+                if default_tags.get("inserted"):
+                    typer.echo(
+                        "    CI default runner tags added for jobs: "
+                        + ", ".join(default_tags.get("affected_jobs", []))
+                    )
+                else:
+                    typer.echo(
+                        "    CI default runner tags unchanged: "
+                        + default_tags.get("reason", "No applicable jobs")
+                    )
             if request.get("omit_ci_project_includes"):
                 typer.echo(
                     "    CI project includes approved for omission: "

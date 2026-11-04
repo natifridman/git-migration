@@ -124,8 +124,12 @@ def test_source_revision_drift_is_explicit_and_does_not_repin_the_plan():
     plan = build_plan(c, source, target)
     original = plan.model_dump()
     source.version = lambda: {"version": plan.source_version, "revision": "c" * 40}
-    with pytest.raises(CompatibilityBlocked, match="--allow-source-revision-drift"):
+    with pytest.raises(CompatibilityBlocked, match="--allow-source-revision-drift") as error:
         verify_endpoints(plan, source, target)
+    guidance = str(error.value)
+    assert "on resume, verify or activate" in guidance
+    assert "resume and verify also require --source-frozen and --destination-isolated" in guidance
+    assert "apply remains strict" in guidance
     observed = verify_endpoints(plan, source, target, allow_source_revision_drift=True)
     assert observed["source"]["revision"] == "c" * 40
     assert observed["destination"] == plan.endpoint_snapshot["destination"]

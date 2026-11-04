@@ -58,18 +58,38 @@ changed URLs, unknown revisions, or runs with activation attempts. See the
 checks proves only their documented coverage; it is not native-import compatibility
 evidence or an application workload test.
 
-For non-pilot Git-copy runs, `--allow-source-revision-drift` on `verify` or
-`activate` is a narrower runtime exception for changing source build revisions
+For non-pilot Git-copy runs, `--allow-source-revision-drift` on `resume`, `verify`
+or `activate` is a narrower runtime exception for changing source build revisions
 under the same exact source version, URLs, and destination version/revision.
 It audits each accepted observation, keeps successful destination smoke evidence,
 and still verifies frozen repository data and CI configuration. It does not
 accept source version changes, destination deployment changes, unknown revisions,
 or native/mixed-strategy drift. The operator must repeat the opt-in each command;
-source freeze and the applicable isolation/review/activation gates still apply.
+`resume` and `verify` require source freeze and destination isolation, while
+`activate` requires source freeze. Start/end endpoint checks still run. This
+does not change saved snapshots, configuration/fingerprints or smoke generations,
+or relax the gates for a default-tag or other saved-run correction. `apply`
+remains strict; preparation, review, verification and activation remain required.
 
 With the default `variables.mode: preserve_scopes`, CI/CD variables are fetched again from their original source scopes during execution and reconciled at the mapped group or project scope. A project cannot flatten an ancestor group's variables without changing precedence. Opt-in `project_explicit` uses the complete declared project-variable list and leaves group variables untouched, as described above. Existing conflicting destination variables block rather than being silently replaced. Unreadable values require operator-provided environment references; variable metadata that the destination cannot preserve must be reconciled before cutover. Imported secret values can still be dangerous if destination runners are available before isolation.
 
 CI edits are conservative and reviewable. Runtime tag expressions, unsupported/dynamic includes, cross-instance includes, unresolved inheritance, external dependency mappings, and complex YAML may require a manual migration MR. For projects with CI jobs, source pipeline statuses are historical and cannot replace an approved destination runner smoke job. Running that job requires `--run-smoke --smoke-isolated`: IT must prevent other triggers and policy-injected jobs before temporary CI enablement. Protected-only runner fleets block because automatic protection of smoke branches is unsupported.
+
+`runners.default_tags` is a separate opt-in from runner selection through
+`runners.tags`. Its default `[]` disables insertion; a configured list allows at
+most 49 unique, nonempty literal tags without whitespace, `$`, `=`, or commas.
+After `tag_map` rewrites, preparation adds root CI `default.tags` only if there
+is no effective existing default tag declaration and at least one untagged job
+accepts defaults. Existing defaults from root or included CI, including `[]`,
+are preserved. Explicit job tags (including `[]`), templates/`extends`, and
+`inherit:default` false or allowlists are respected. Reliable effective local
+and included CI resolution is mandatory; unsupported/dynamic configuration and
+project includes without reliable merged-lint evidence block. The feature does
+not infer a prepared tree's defaults from source-commit lint when local included
+files also change alongside project includes; that combination blocks for
+manual review. It does not expand downstream-pipeline support, configure runners, or create CI for a
+`no_ci` project. Reviewable MRs, quarantine, complete job-tag/protected-ref runner
+matching, smoke verification, and activation gates remain required.
 
 `repositories[].omit_ci_project_includes` explicitly permits removal of matching
 literal project includes in review MRs, including in supported local CI files.
@@ -82,12 +102,39 @@ configuration and retains superseded evidence; identical retries recover the
 same MR. See the [omission procedure](git-copy.md#omit-an-optional-project-ci-include-after-git-copy).
 
 The explicit `resume --runner-tag-map OLD=NEW` correction is limited to one
-non-pilot Git-copy repository with completed import/baseline and unchanged CI
-preparation, before any CI MR, smoke, or activation attempt. It cannot discard
+non-pilot Git-copy repository with completed import/baseline and overall
+preparation, and unchanged CI preparation without errors or pending review,
+before any CI write/MR, smoke, or activation attempt. It cannot discard
 existing or ambiguous remote changes, change runner selection, or bypass review.
 It audits a newly fingerprinted saved-run configuration and retains superseded
 evidence. The original manifest/plan files remain unchanged; see the
 [correction procedure](git-copy.md#correct-a-missing-tag-mapping-after-git-copy).
+
+Repeatable `resume --default-runner-tag TAG` uses the same guard for inactive
+single-repository runs, requires completed snapshot evidence and at least one
+saved untagged job, and replaces only the saved default-tag list. It can be
+combined atomically with `--runner-tag-map`, but not with
+`--omit-ci-project-include`. Existing defaults or inheritance opt-outs can make
+insertion a no-op. Old/new lists, maps, hashes and superseded evidence are
+audited; identical retries recover the same deterministic MR, and different
+corrections cannot discard incomplete or ambiguous writes. See the
+[default-tag procedure](git-copy.md#add-destination-default-tags-after-git-copy).
+
+Existing owned, open migration MRs require the separate
+`resume --amend-runner-mr IID --default-runner-tag TAG` opt-in. It is limited to
+an inactive, non-pilot, single-repository Git-copy run with completed
+snapshot/import/baseline and preparation, exactly one saved matching MR, exact
+saved source head and unchanged baseline target in the same project, and no
+smoke or activation attempt. It adds only root CI defaults on the same branch
+and Draft MR, retaining prior include omissions; new tag-map/include-omission
+corrections cannot be combined. Existing defaults and opt-outs are preserved;
+no applicable insertion refuses a new amendment without changes. Durable
+`runner_mr_amendment_N` intent retains the old request and hashes without raw CI
+YAML. Identical retries recover without duplicate commits; a pending amendment
+blocks different requests and ordinary resume/verify/activate. Fresh review of
+the new commit, quarantine, verification, smoke and activation remain required.
+The ordinary pre-write correction's scope is unchanged. See the
+[amendment procedure](git-copy.md#add-default-tags-to-an-existing-migration-mr).
 
 A project verified to have no `.gitlab-ci.yml`, no custom CI path, and explicitly disabled Auto DevOps is recorded as `no_ci`. It needs no runner MR or smoke job, and activation keeps CI disabled. Missing custom configuration and inaccessible files remain errors.
 

@@ -132,6 +132,7 @@ class RunnerProfile(Model):
     allowed_runner_ids: list[int] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     tag_map: dict[str, list[str]] = Field(default_factory=dict)
+    default_tags: list[str] = Field(default_factory=list)
     shared_enabled: bool = False
     group_enabled: bool = True
     enforcement: Literal["exclusive_access", "job_eligibility"] = "exclusive_access"
@@ -150,6 +151,17 @@ class RunnerProfile(Model):
             raise ValueError("Runner tags must be nonempty literal tags without commas")
         if len(value) != len(set(value)):
             raise ValueError("Runner tags must be unique")
+        return value
+
+    @field_validator("default_tags")
+    @classmethod
+    def validate_default_tags(cls, value: list[str]) -> list[str]:
+        if len(value) > 49 or any(
+            not tag or any(char.isspace() or char in "$=," for char in tag) for tag in value
+        ):
+            raise ValueError("Default runner tags require at most 49 nonempty literal tags")
+        if len(value) != len(set(value)):
+            raise ValueError("Default runner tags must be unique")
         return value
 
     @model_validator(mode="after")
@@ -268,6 +280,8 @@ class MigrationConfig(Model):
         # Preserve fingerprints of existing manifests and saved plans that use IDs.
         if not self.runners.tags:
             data["runners"].pop("tags")
+        if not self.runners.default_tags:
+            data["runners"].pop("default_tags")
         if self.runners.enforcement == "exclusive_access":
             data["runners"].pop("enforcement")
         if self.compatibility == CompatibilityPolicy():

@@ -6,7 +6,7 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
@@ -31,8 +31,10 @@ from git_migration.steps.environments import reconcile_environments
 from git_migration.steps.pages import reconcile_pages
 from git_migration.steps.preflight import encoded, ensure_groups, unmapped_ancestor_variables
 from git_migration.steps.runners import (
+    apply_runner_default_amendment,
     configure_runners,
     inspect_runners,
+    plan_runner_default_amendment,
     prepare_runner_merge_request,
     verify_prepared_merge_request,
     verify_runner_access,
@@ -111,7 +113,7 @@ class Migrator:
         self._save(repo, name, "failed", data)
 
     @contextmanager
-    def _operation(self) -> Iterator[None]:
+    def _operation(self, *, allow_pending_runner_amendment: bool = False) -> Iterator[None]:
         with self.store.lock():
             saved_plan = self.store.plan(self.run_id)
             if saved_plan.config_hash != self.plan.config_hash:
@@ -125,11 +127,14 @@ class Migrator:
                 raise MigrationBlocked("Saved endpoints changed; reload the run before retrying")
             if self.store.report(self.run_id)["status"] == "active":
                 raise MigrationBlocked("Run is already active; use report to inspect it")
+            pending = self.store.pending_runner_amendment(self.run_id)
             self._cancel.clear()
             try:
                 for repo in self.plan.config.repositories:
                     recover_ci_api(self.destination, self._directory(repo))
                 self._recover_activation()
+                if pending and not allow_pending_runner_amendment:
+                    raise MigrationBlocked(self.store.runner_amendment_recovery_message(pending))
                 yield
             except BaseException as error:
                 self._cancel.set()
@@ -204,9 +209,9 @@ class Migrator:
                     {"active": False},
                 )
 
-    def _import(self, repo: Repository) -> bool:
+    def _import(self, repo: Repository, *, allow_source_revision_drift: bool = False) -> bool:
         try:
-            self._check_environment()
+            self._check_environment(allow_source_revision_drift)
             source_project = self.source.project(repo.source_path)
             self._check_source_schedules(source_project["id"])
             directory = self._directory(repo)
@@ -607,6 +612,31 @@ class Migrator:
                     if checked["blockers"]:
                         return False
                     continue
+                unchanged = next(
+                    (
+                        item
+                        for item in previous_requests
+                        if item.get("target_branch") == branch
+                        and item.get("status") == "unchanged"
+                        and isinstance(item.get("default_tags"), Mapping)
+                        and "merged_ci_sha256" in item["default_tags"]
+                    ),
+                    None,
+                )
+                if unchanged:
+                    checked = verify_runner_configuration(
+                        self.destination,
+                        target["id"],
+                        unchanged,
+                        ci_path=source_project.get("ci_config_path") or ".gitlab-ci.yml",
+                    )
+                    if checked["blockers"]:
+                        raise MigrationBlocked("; ".join(checked["blockers"]))
+                    if previous and previous["status"] != "superseded":
+                        requests.append(
+                            {**unchanged, "jobs": checked["jobs"], "blockers": checked["blockers"]}
+                        )
+                        continue
                 branch_head = self.destination.get(
                     f"/projects/{target['id']}/repository/branches/{encoded(branch)}"
                 )
@@ -621,6 +651,7 @@ class Migrator:
                     target["id"],
                     branch,
                     runners.tag_map,
+                    default_tags=runners.default_tags,
                     ci_path=source_project.get("ci_config_path") or ".gitlab-ci.yml",
                     project_include_map={
                         item.source_path: item.destination_path
@@ -694,33 +725,95 @@ class Migrator:
         self,
         runner_tag_map: dict[str, list[str]] | None = None,
         *,
+        default_tags: list[str] | None = None,
         omit_ci_project_includes: list[str] | None = None,
+        allow_source_revision_drift: bool = False,
+        amend_runner_mr: int | None = None,
     ) -> dict[str, Any]:
         if self.plan.blocked:
             raise MigrationBlocked("Resolve plan blockers before applying")
-        if runner_tag_map and omit_ci_project_includes:
+        if (runner_tag_map or default_tags is not None) and omit_ci_project_includes:
             raise MigrationBlocked("Correct runner tags and CI include omissions separately")
-        with self._operation():
+        if amend_runner_mr is not None:
+            if not default_tags or runner_tag_map or omit_ci_project_includes:
+                raise MigrationBlocked(
+                    "--amend-runner-mr requires default runner tags and no tag-map or include corrections"
+                )
+            # Reject unsafe saved runs before recovery or amendment planning reads the server.
+            self.store.validate_runner_mr_amendment(
+                self.run_id, amend_runner_mr, default_tags, self.plan.config_hash
+            )
+        with self._operation(allow_pending_runner_amendment=amend_runner_mr is not None):
             smoke_attempted = (
                 any(
-                    any(self._directory(repo).glob("smoke-*.json"))
+                    any(self._directory(repo).rglob("smoke-*.json"))
                     for repo in self.plan.config.repositories
                 )
-                if runner_tag_map or omit_ci_project_includes
+                if runner_tag_map or default_tags is not None or omit_ci_project_includes
                 else False
             )
             self._recover_smokes()
-            self._check_environment()
-            if runner_tag_map:
-                if smoke_attempted and any(
-                    self.plan.config.runners.tag_map.get(tag) != targets
-                    for tag, targets in runner_tag_map.items()
+            self._check_environment(allow_source_revision_drift)
+            if amend_runner_mr is not None:
+                assert default_tags is not None
+                context = self.store.validate_runner_mr_amendment(
+                    self.run_id,
+                    amend_runner_mr,
+                    default_tags,
+                    self.plan.config_hash,
+                    smoke_attempted=smoke_attempted,
+                )
+                if context["status"] != "complete":
+                    repo = self.plan.config.repositories[0]
+                    if context["status"] == "pending":
+                        amendment = context["amendment"]
+                    else:
+                        target = self._target(repo)
+                        snapshot = self._step(repo, "snapshot")
+                        assert snapshot is not None
+                        proposal = plan_runner_default_amendment(
+                            self.destination,
+                            target["id"],
+                            context["request"],
+                            default_tags,
+                            ci_path=snapshot["data"].get("ci_config_path") or ".gitlab-ci.yml",
+                        )
+                        amendment = self.store.begin_runner_mr_amendment(
+                            self.run_id,
+                            amend_runner_mr,
+                            default_tags,
+                            self.plan.config_hash,
+                            proposal,
+                            smoke_attempted=smoke_attempted,
+                        )
+                    # The saved intent exists before the first possible remote write.
+                    target = self._target(repo)
+                    if target["id"] != amendment["data"]["proposal"]["project_id"]:
+                        raise MigrationBlocked("Runner MR amendment destination identity changed")
+                    updated = apply_runner_default_amendment(
+                        self.destination, target["id"], amendment["data"]["proposal"]
+                    )
+                    self._check_endpoints(allow_source_revision_drift)
+                    self.plan = self.store.finish_runner_mr_amendment(
+                        self.run_id, amendment["name"], updated, self.plan.config_hash
+                    )
+            elif runner_tag_map or default_tags is not None:
+                if smoke_attempted and (
+                    any(
+                        self.plan.config.runners.tag_map.get(tag) != targets
+                        for tag, targets in (runner_tag_map or {}).items()
+                    )
+                    or default_tags is not None
+                    and self.plan.config.runners.default_tags != default_tags
                 ):
                     raise MigrationBlocked(
                         "Runner tag correction refused: smoke recovery or ownership evidence already exists"
                     )
                 self.plan = self.store.revise_runner_tags(
-                    self.run_id, runner_tag_map, self.plan.config_hash
+                    self.run_id,
+                    runner_tag_map or {},
+                    self.plan.config_hash,
+                    default_tags=default_tags,
                 )
             if omit_ci_project_includes:
                 if smoke_attempted and any(
@@ -735,7 +828,12 @@ class Migrator:
                     self.run_id, omit_ci_project_includes, self.plan.config_hash
                 )
             ensure_groups(self.plan, self.destination)
-            imported = self._parallel(self._import, self.plan.config.repositories)
+            import_repository = (
+                partial(self._import, allow_source_revision_drift=True)
+                if allow_source_revision_drift
+                else self._import
+            )
+            imported = self._parallel(import_repository, self.plan.config.repositories)
             group_ready = self._groups()
             ready = [
                 repo
@@ -743,6 +841,7 @@ class Migrator:
                 if (self._step(repo, "import") or {}).get("status") == "complete"
             ]
             prepared = self._parallel(self._prepare, ready) if group_ready else False
+            self._check_endpoints(allow_source_revision_drift)
             self.store.set_status(
                 self.run_id,
                 "awaiting_verification" if imported and group_ready and prepared else "blocked",

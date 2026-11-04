@@ -7,6 +7,8 @@ from typing import Any
 import gitlab
 import pytest
 import requests
+from rich.text import Text
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from git_migration import __version__, cli
@@ -407,6 +409,201 @@ def test_resume_passes_explicit_tag_corrections(tmp_path, monkeypatch):
     assert received == [{"old": ["approved", "linux"], "legacy": ["approved"]}]
 
 
+@pytest.mark.parametrize("with_map", [False, True])
+def test_resume_passes_replacement_default_runner_tags(tmp_path, monkeypatch, with_map):
+    plan = make_plan()
+    plan.config.runners.default_tags = ["previous"]
+    plan.config_hash = plan.config.fingerprint()
+    store = StateStore(tmp_path)
+    run = store.create_run(plan)
+    received = []
+
+    class Migrator:
+        def __init__(self, saved, *args, **kwargs):
+            assert saved.config.runners.default_tags == ["previous"]
+
+        def prepare(self, changes, *, default_tags):
+            received.append((changes, default_tags))
+            return {"id": run, "status": "awaiting_verification"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "resume",
+            run,
+            "--source-frozen",
+            "--destination-isolated",
+            "--default-runner-tag",
+            "approved",
+            "--default-runner-tag",
+            "linux",
+            *(["--runner-tag-map", "old=mapped"] if with_map else []),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == [({"old": ["mapped"]} if with_map else {}, ["approved", "linux"])]
+
+
+@pytest.mark.parametrize("allow_revision_drift", [False, True])
+def test_resume_passes_explicit_saved_runner_mr_amendment(
+    tmp_path, monkeypatch, allow_revision_drift
+):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["ci_api_isolated"] is True
+
+        def prepare(self, changes, **kwargs):
+            received.append((changes, kwargs))
+            return {"id": run, "status": "awaiting_verification"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "resume",
+            run,
+            "--source-frozen",
+            "--destination-isolated",
+            "--ci-api-isolated",
+            "--amend-runner-mr",
+            "21",
+            "--default-runner-tag",
+            "approved",
+            "--default-runner-tag",
+            "linux",
+            *(["--allow-source-revision-drift"] if allow_revision_drift else []),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    options = {"amend_runner_mr": 21, "default_tags": ["approved", "linux"]}
+    if allow_revision_drift:
+        options["allow_source_revision_drift"] = True
+    assert received == [({}, options)]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--amend-runner-mr", "21"],
+        ["--amend-runner-mr", "0", "--default-runner-tag", "approved"],
+        ["--amend-runner-mr", "-1", "--default-runner-tag", "approved"],
+        ["--amend-runner-mr", "not-a-number", "--default-runner-tag", "approved"],
+        [
+            "--amend-runner-mr",
+            "21",
+            "--default-runner-tag",
+            "approved",
+            "--runner-tag-map",
+            "old=new",
+        ],
+        [
+            "--amend-runner-mr",
+            "21",
+            "--default-runner-tag",
+            "approved",
+            "--omit-ci-project-include",
+            "team/optional",
+        ],
+    ],
+)
+@pytest.mark.parametrize("color", [False, True], ids=["plain", "color"])
+def test_invalid_runner_mr_amendment_stops_before_state_and_providers(
+    tmp_path, monkeypatch, flags, color
+):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", color)
+    monkeypatch.setattr(rich_utils, "COLOR_SYSTEM", "standard" if color else None)
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Invalid amendment must stop first")
+    )
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "resume",
+            "synthetic-run",
+            "--source-frozen",
+            "--destination-isolated",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "amend-runner-mr" in Text.from_ansi(result.output).plain
+    assert not state.exists()
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        [""],
+        ["$DYNAMIC"],
+        ["two words"],
+        ["linux,docker"],
+        ["x=y"],
+        ["same", "same"],
+        [f"tag-{number}" for number in range(50)],
+    ],
+)
+def test_invalid_default_tags_stop_before_state_or_provider_access(tmp_path, monkeypatch, tags):
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Invalid tags must stop first")
+    )
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "resume",
+            "synthetic-run",
+            "--source-frozen",
+            "--destination-isolated",
+            *[part for tag in tags for part in ("--default-runner-tag", tag)],
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--default-runner-tag" in result.output
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("with_map", [False, True])
+def test_default_tags_and_include_omissions_are_mutually_exclusive(tmp_path, monkeypatch, with_map):
+    monkeypatch.setattr(
+        cli, "Migrator", lambda *args, **kwargs: pytest.fail("Mixed correction must stop first")
+    )
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "resume",
+            "synthetic-run",
+            "--source-frozen",
+            "--destination-isolated",
+            "--default-runner-tag",
+            "approved",
+            "--omit-ci-project-include",
+            "team/optional-review",
+            *(["--runner-tag-map", "old=mapped"] if with_map else []),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "separately" in result.output
+    assert not state.exists()
+
+
 def test_resume_passes_explicit_include_omissions(tmp_path, monkeypatch):
     store = StateStore(tmp_path)
     run = store.create_run(make_plan())
@@ -594,13 +791,14 @@ def test_verify_passes_explicit_endpoint_refresh(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("flags", [[], ["--source-frozen"], ["--destination-isolated"]])
-def test_source_revision_exception_requires_attestations(tmp_path, flags):
+@pytest.mark.parametrize("command", ["verify", "resume"])
+def test_source_revision_exception_requires_attestations(tmp_path, flags, command):
     result = runner.invoke(
         cli.app,
         [
             "--state-dir",
             str(tmp_path / "state"),
-            "verify",
+            command,
             "synthetic-run",
             "--allow-source-revision-drift",
             *flags,
@@ -611,7 +809,7 @@ def test_source_revision_exception_requires_attestations(tmp_path, flags):
     assert not (tmp_path / "state").exists()
 
 
-@pytest.mark.parametrize("command", ["verify", "activate"])
+@pytest.mark.parametrize("command", ["verify", "activate", "resume"])
 def test_source_revision_exception_is_passed_per_command(tmp_path, monkeypatch, command):
     store = StateStore(tmp_path)
     run = store.create_run(make_plan())
@@ -631,10 +829,83 @@ def test_source_revision_exception_is_passed_per_command(tmp_path, monkeypatch, 
             received.append(allow_source_revision_drift)
             return {"id": run, "status": "active"}
 
+        def prepare(self, *, allow_source_revision_drift):
+            received.append(allow_source_revision_drift)
+            return {"id": run, "status": "awaiting_verification"}
+
     monkeypatch.setattr(cli, "Migrator", Migrator)
     flags = ["--source-frozen", "--allow-source-revision-drift"]
-    if command == "verify":
+    if command in {"verify", "resume"}:
         flags.append("--destination-isolated")
     result = runner.invoke(cli.app, ["--state-dir", str(tmp_path), command, run, *flags])
     assert result.exit_code == 0, result.output
     assert received == [True]
+
+
+@pytest.mark.parametrize(
+    ("flags", "arguments", "options"),
+    [
+        (["--default-runner-tag", "approved"], ({},), {"default_tags": ["approved"]}),
+        (["--runner-tag-map", "old=new"], ({"old": ["new"]},), {}),
+        (
+            ["--runner-tag-map", "old=new", "--default-runner-tag", "approved"],
+            ({"old": ["new"]},),
+            {"default_tags": ["approved"]},
+        ),
+        (
+            ["--omit-ci-project-include", "team/optional"],
+            (),
+            {"omit_ci_project_includes": ["team/optional"]},
+        ),
+    ],
+)
+def test_resume_source_revision_exception_can_accompany_corrections(
+    tmp_path, monkeypatch, flags, arguments, options
+):
+    store = StateStore(tmp_path)
+    run = store.create_run(make_plan())
+    received = []
+
+    class Migrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare(self, *args, **kwargs):
+            received.append((args, kwargs))
+            return {"id": run, "status": "awaiting_verification"}
+
+    monkeypatch.setattr(cli, "Migrator", Migrator)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(tmp_path),
+            "resume",
+            run,
+            "--source-frozen",
+            "--destination-isolated",
+            "--allow-source-revision-drift",
+            *flags,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == [(arguments, {**options, "allow_source_revision_drift": True})]
+
+
+def test_apply_does_not_accept_source_revision_exception(tmp_path):
+    state = tmp_path / "state"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--state-dir",
+            str(state),
+            "apply",
+            "synthetic-plan.json",
+            "--source-frozen",
+            "--destination-isolated",
+            "--allow-source-revision-drift",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "No such option" in result.output
+    assert not state.exists()
